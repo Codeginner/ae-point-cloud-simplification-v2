@@ -123,6 +123,16 @@ class NormalConsistencyLoss(nn.Module):
         normals  = Vh[:, -1, :]                                 # (B*N, 3)
         normals  = normals.reshape(B, N, 3)                     # (B, N, 3)
 
+        # Guard: SVD can return NaN when neighbourhood is degenerate
+        # (e.g., all k neighbours at the exact same position).
+        # Replace any NaN normal with a safe default (0,0,1).
+        normals = torch.nan_to_num(normals, nan=0.0)
+        # Ensure no zero-norm normals after nan replacement
+        fallback = torch.zeros_like(normals)
+        fallback[..., 2] = 1.0                                  # (0,0,1) default
+        zero_mask = (normals.norm(dim=-1, keepdim=True) < self.eps)
+        normals = torch.where(zero_mask, fallback, normals)
+
         # Normalise
         normals = normals / (normals.norm(dim=-1, keepdim=True) + self.eps)
         return normals

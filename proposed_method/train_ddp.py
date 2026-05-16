@@ -182,7 +182,25 @@ def train_one_epoch(
         out = model(P, compute_loss=True)
         loss = out["loss"]
 
+        # Guard: skip batch if loss is NaN/Inf (e.g. degenerate point cloud)
+        if not torch.isfinite(loss["total"]):
+            if rank == 0:
+                logger.warning(f"[Epoch {epoch+1} step {step}] NaN/Inf loss detected — skipping batch")
+            optimizer.zero_grad()
+            continue
+
         loss["total"].backward()
+
+        # Check for NaN in gradients before stepping
+        has_nan_grad = any(
+            p.grad is not None and not torch.isfinite(p.grad).all()
+            for p in model.parameters()
+        )
+        if has_nan_grad:
+            if rank == 0:
+                logger.warning(f"[Epoch {epoch+1} step {step}] NaN gradient detected — skipping step")
+            optimizer.zero_grad()
+            continue
 
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 

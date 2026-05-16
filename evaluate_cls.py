@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, num_class):
+def evaluate(model, loader, device, num_class, tta=False, tta_runs=10):
     model.eval()
     all_preds, all_labels = [], []
 
@@ -38,8 +38,28 @@ def evaluate(model, loader, device, num_class):
         P      = P.to(device)
         labels = labels.to(device)
 
-        out    = model(P, labels=None, compute_loss=False)
-        preds  = out["logits"].argmax(dim=-1)
+        if tta:
+            # Test-Time Augmentation: average logits over random rotations
+            logits_sum = None
+            for _ in range(tta_runs):
+                # Random rotation around Y axis
+                theta = torch.rand(1).item() * 2 * 3.14159
+                cos_t, sin_t = torch.cos(torch.tensor(theta)), torch.sin(torch.tensor(theta))
+                rot = torch.tensor([[cos_t, 0, sin_t],
+                                    [0,     1, 0    ],
+                                    [-sin_t,0, cos_t]], device=device)
+                P_aug = P @ rot.T
+
+                # Random jitter
+                P_aug = P_aug + torch.randn_like(P_aug) * 0.01
+
+                out = model(P_aug, labels=None, compute_loss=False)
+                logits_sum = out["logits"] if logits_sum is None else logits_sum + out["logits"]
+
+            preds = logits_sum.argmax(dim=-1)
+        else:
+            out   = model(P, labels=None, compute_loss=False)
+            preds = out["logits"].argmax(dim=-1)
 
         all_preds.append(preds.cpu())
         all_labels.append(labels.cpu())

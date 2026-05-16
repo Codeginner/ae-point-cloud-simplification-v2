@@ -327,7 +327,7 @@ def run_test(args: argparse.Namespace) -> None:
         shuffle=False, num_workers=args.num_workers, pin_memory=True,
     )
 
-    model = PointCloudSimplifier(M=args.M, k=args.k).to(device)
+    model = PointCloudSimplifier(M=args.M, k=args.k, alpha=args.alpha, threshold=args.threshold, lambda_1=args.lambda_1, lambda_2=args.lambda_2, lambda_3=args.lambda_3, lambda_4=args.lambda_4).to(device)
 
     assert args.resume is not None, "Test mode butuh --resume path/ke/checkpoint.pth"
     ckpt  = torch.load(args.resume, map_location=device)
@@ -382,7 +382,7 @@ def ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
                     f"Val: {len(val_loader.dataset)} samples")
 
     # ── Model ─────────────────────────────────────────────────────────
-    model = PointCloudSimplifier(M=args.M, k=args.k).to(device)
+    model = PointCloudSimplifier(M=args.M, k=args.k, alpha=args.alpha, threshold=args.threshold, lambda_1=args.lambda_1, lambda_2=args.lambda_2, lambda_3=args.lambda_3, lambda_4=args.lambda_4).to(device)
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=False)
 
@@ -527,6 +527,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers",  type=int,   default=4)
     parser.add_argument("--checkpoint",   type=str,   default="./checkpoints")
     parser.add_argument("--resume",       type=str,   default=None)
+    parser.add_argument("--lambda_1",     type=float, default=1.0)
+    parser.add_argument("--lambda_2",     type=float, default=0.5)
+    parser.add_argument("--lambda_3",     type=float, default=0.3)
+    parser.add_argument("--lambda_4",     type=float, default=0.3, help="Weight for score supervision loss")
+    parser.add_argument("--alpha",        type=float, default=0.7, help="Contour fraction in selector")
+    parser.add_argument("--threshold",    type=float, default=0.5, help="NC threshold contour vs flat")
     return parser.parse_args()
 
 

@@ -409,8 +409,34 @@ def ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=False)
 
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+
+    # Match APES schedule:
+    # - Linear warmup epoch 0→5  (lr: 1e-4*1e-4 → 1e-4)
+    # - CosineAnnealingLR epoch 5→100  (eta_min=1e-6)
+    warmup_epochs  = 5
+    cosine_epochs  = args.epochs - warmup_epochs
+
+    warmup_scheduler = optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=1e-4,   # start_lr = 1e-4 * 1e-4 = 1e-8
+        end_factor=1.0,      # end_lr   = 1e-4
+        total_iters=warmup_epochs,
+    )
+    cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=cosine_epochs,
+        eta_min=1e-6,
+    )
+    scheduler = optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_epochs],
+    )
 
     start_epoch   = 0
     best_val_loss = float("inf")
@@ -546,8 +572,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs",       type=int,   default=200)
     parser.add_argument("--batch_size",   type=int,   default=16,
                         help="Batch size PER GPU")
-    parser.add_argument("--lr",           type=float, default=1e-3)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--lr",           type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--num_workers",  type=int,   default=4)
     parser.add_argument("--checkpoint",   type=str,   default="./checkpoints")
     parser.add_argument("--resume",       type=str,   default=None)

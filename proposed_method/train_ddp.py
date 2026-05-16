@@ -160,9 +160,9 @@ def train_one_epoch(
         "total": 0.0,
         "chamfer": 0.0,
         "normal": 0.0,
-        "nc": 0.0
+        "nc": 0.0,
+        "score": 0.0,
     }
-
     # ONE EPOCH = ONE LINE
     pbar = tqdm(
         total=len(loader),
@@ -336,7 +336,7 @@ def run_test(args: argparse.Namespace) -> None:
     print(f"[test] Loaded checkpoint: {args.resume}")
 
     model.eval()
-    totals = {"total": 0.0, "chamfer": 0.0, "normal": 0.0, "nc": 0.0}
+    totals = {"total": 0.0, "chamfer": 0.0, "normal": 0.0, "nc": 0.0, "score": 0.0}
 
     pbar = tqdm(val_loader, desc="[Test]", dynamic_ncols=True)
     for step, (P, _) in enumerate(pbar):

@@ -90,10 +90,20 @@ def main():
     p.add_argument("--n_points",   type=int, default=1024)
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--num_workers",type=int, default=4)
+    p.add_argument("--runs",       type=int, default=5,
+                   help="Jumlah run untuk averaging (atasi non-determinism)")
+    p.add_argument("--seed",       type=int, default=42)
     args = p.parse_args()
 
+    # ── Determinism ────────────────────────────────────────────────────────
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = False
+    np.random.seed(args.seed)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Device: {device}")
+    logger.info(f"Device: {device}  seed={args.seed}  runs={args.runs}")
 
     # Dataset
     test_ds = PointCloudDataset(args.data_root, "test", args.n_points, augment=False)
@@ -107,16 +117,29 @@ def main():
     model.load_state_dict(ckpt.get("model", ckpt))
     logger.info(f"Loaded: {args.checkpoint}")
 
-    # Evaluate
-    result = evaluate(model, loader, device, args.num_class)
+    # Multi-run evaluation
+    oa_list, macc_list = [], []
+    for i in range(args.runs):
+        torch.manual_seed(args.seed + i)
+        torch.cuda.manual_seed_all(args.seed + i)
+        r = evaluate(model, loader, device, args.num_class)
+        oa_list.append(r["overall_acc"])
+        macc_list.append(r["per_class_acc"])
+        logger.info(f"  run {i+1}/{args.runs}  OA={r['overall_acc']:.2f}%  mAcc={r['per_class_acc']:.2f}%")
 
-    print(f"\n{'='*40}")
-    print(f"  Overall Accuracy : {result['overall_acc']:.2f}%")
-    print(f"  Mean Class Acc   : {result['per_class_acc']:.2f}%")
-    print(f"{'='*40}")
+    oa_mean   = round(np.mean(oa_list), 2)
+    oa_std    = round(np.std(oa_list),  2)
+    macc_mean = round(np.mean(macc_list), 2)
+
+    print(f"\n{'='*45}")
+    print(f"  Runs             : {args.runs}")
+    print(f"  Overall Accuracy : {oa_mean:.2f}% ± {oa_std:.2f}%")
+    print(f"  Mean Class Acc   : {macc_mean:.2f}%")
+    print(f"{'='*45}")
     print(f"\n  APES (official)  : 93.53%")
-    gap = result['overall_acc'] - 93.53
+    gap = oa_mean - 93.53
     print(f"  Gap vs APES      : {gap:+.2f}%")
+    print(f"\n  → Report: {oa_mean:.2f}% ± {oa_std:.2f}%")
 
 
 if __name__ == "__main__":

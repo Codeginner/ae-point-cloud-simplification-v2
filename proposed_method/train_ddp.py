@@ -238,6 +238,7 @@ def validate(
         "chamfer": 0.0,
         "normal": 0.0,
         "nc": 0.0,
+        "score": 0.0,
         # BUG FIX: track CD(P_simplified, P_input) separately.
         # The existing "chamfer" measures CD(P_recon, P_input) which was
         # misleadingly low even when the visual quality was bad.

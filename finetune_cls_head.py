@@ -81,7 +81,7 @@ class ClsHead(nn.Module):
         self.ec2 = nn.Sequential(
             nn.Conv2d(128, 64, 1, bias=False), nn.BatchNorm2d(64),  nn.LeakyReLU(0.2))
         self.ec3 = nn.Sequential(
-            nn.Conv2d(128,128, 1, bias=False), nn.BatchNorm2d(128), nn.LeakyReLU(0.2))
+            nn.Conv2d(256, 128, 1, bias=False), nn.BatchNorm2d(128), nn.LeakyReLU(0.2))
         # Aggregation
         self.agg = nn.Sequential(
             nn.Conv1d(256, 512, 1, bias=False), nn.BatchNorm1d(512), nn.LeakyReLU(0.2))

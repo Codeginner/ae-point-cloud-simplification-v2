@@ -18,6 +18,7 @@ Class:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 from .encoder import DGCNNEncoder
@@ -27,6 +28,52 @@ from .selector import AdaptiveSelector
 from .decoder import FoldingNetDecoder
 from .loss import GeometryAwareLoss
 from .utils import index_points
+
+
+# ===========================================================================
+# Lightweight Classification Head
+# Takes simplified point features f_s (B, M, 448) → class logits (B, C)
+# Trained jointly with reconstruction — gradient flows through STE to selector
+# ===========================================================================
+
+class ClsHead(nn.Module):
+    """
+    Classification head over simplified point features.
+
+    Uses global max+mean pooling over f_s then a 2-layer MLP.
+    Deliberately lightweight — the heavy lifting is done by the DGCNN encoder.
+
+    Args:
+        in_dim    : feature dimension from encoder (448)
+        num_class : number of output classes
+        dropout   : dropout rate
+    """
+    def __init__(self, in_dim: int = 448, num_class: int = 10, dropout: float = 0.4):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            # Project pooled features
+            nn.Linear(in_dim * 2, 512, bias=False),
+            nn.BatchNorm1d(512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(512, 256, bias=False),
+            nn.BatchNorm1d(256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(256, num_class),
+        )
+
+    def forward(self, f_s: Tensor) -> Tensor:
+        """
+        Args:
+            f_s : simplified point features (B, M, 448)
+        Returns:
+            logits : (B, num_class)
+        """
+        # Global descriptor: max + mean pooling over M simplified points
+        g = torch.cat([f_s.max(dim=1).values,
+                       f_s.mean(dim=1)], dim=-1)   # (B, 896)
+        return self.mlp(g)                          # (B, num_class)
 
 
 class PointCloudSimplifier(nn.Module):
@@ -59,11 +106,14 @@ class PointCloudSimplifier(nn.Module):
         lambda_2: float = 0.5,
         lambda_3: float = 0.3,
         lambda_4: float = 0.5,
+        num_class: int = 10,
+        lambda_cls: float = 0.5,
     ) -> None:
 
         super().__init__()
 
         self.M = M
+        self.lambda_cls = lambda_cls
 
         # --------------------------------------------------------------
         # Encoder
@@ -128,6 +178,16 @@ class PointCloudSimplifier(nn.Module):
             lambda_4=lambda_4,
         )
 
+        # --------------------------------------------------------------
+        # Classification Head (joint training)
+        # Input: f_s (B, M, 448) → logits (B, num_class)
+        # --------------------------------------------------------------
+
+        self.cls_head = ClsHead(
+            in_dim=448,
+            num_class=num_class,
+        )
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
@@ -135,6 +195,7 @@ class PointCloudSimplifier(nn.Module):
     def forward(
         self,
         P: Tensor,
+        labels: Tensor = None,
         compute_loss: bool = True,
     ) -> dict[str, Tensor]:
         """
@@ -213,19 +274,23 @@ class PointCloudSimplifier(nn.Module):
         # Output dictionary
         # --------------------------------------------------------------
 
+        # --------------------------------------------------------------
+        # 7. Classification Head
+        # logits shape = (B, num_class)
+        # --------------------------------------------------------------
+
+        logits = self.cls_head(f_s)
+
         out = {
-
             "P_simplified": P_s,
-
-            "P_recon": P_recon,
-
-            "score": score,
-
-            "idx": idx,
+            "P_recon":      P_recon,
+            "score":        score,
+            "idx":          idx,
+            "logits":       logits,
         }
 
         # --------------------------------------------------------------
-        # 7. Geometry-aware loss
+        # 8. Joint loss: geometry + classification
         # --------------------------------------------------------------
 
         if compute_loss:
@@ -236,6 +301,14 @@ class PointCloudSimplifier(nn.Module):
                 P_s,
                 score,
             )
+
+            # Classification loss (only when labels provided)
+            if labels is not None:
+                L_cls = F.cross_entropy(logits, labels)
+                loss_dict["cls"]   = L_cls
+                loss_dict["total"] = loss_dict["total"] + self.lambda_cls * L_cls
+            else:
+                loss_dict["cls"] = torch.tensor(0.0, device=P.device)
 
             out["loss"] = loss_dict
 

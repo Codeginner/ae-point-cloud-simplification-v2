@@ -162,6 +162,7 @@ def train_one_epoch(
         "normal": 0.0,
         "nc": 0.0,
         "score": 0.0,
+        "cls": 0.0,
     }
     # ONE EPOCH = ONE LINE
     pbar = tqdm(
@@ -173,13 +174,14 @@ def train_one_epoch(
         leave=True,
     )
 
-    for step, (P, _) in enumerate(loader):
+    for step, (P, labels) in enumerate(loader):
 
         P = P.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
 
         optimizer.zero_grad()
 
-        out = model(P, compute_loss=True)
+        out = model(P, labels, compute_loss=True)
         loss = out["loss"]
 
         # Guard: skip batch if loss is NaN/Inf (e.g. degenerate point cloud)
@@ -263,6 +265,7 @@ def validate(
         # "cd_simplified" measures how well the SELECTOR preserves the
         # original shape — this is the true simplification quality metric.
         "cd_simplified": 0.0,
+        "cls": 0.0,
     }
 
     pbar = tqdm(
@@ -274,11 +277,12 @@ def validate(
         leave=True,
     )
 
-    for step, (P, _) in enumerate(loader):
+    for step, (P, labels) in enumerate(loader):
 
         P = P.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
 
-        out = model(P, compute_loss=True)
+        out = model(P, labels, compute_loss=True)
         loss = out["loss"]
 
         for k, v in loss.items():
@@ -346,7 +350,7 @@ def run_test(args: argparse.Namespace) -> None:
         shuffle=False, num_workers=args.num_workers, pin_memory=True,
     )
 
-    model = PointCloudSimplifier(M=args.M, k=args.k, alpha=args.alpha, threshold=args.threshold, lambda_1=args.lambda_1, lambda_2=args.lambda_2, lambda_3=args.lambda_3, lambda_4=args.lambda_4).to(device)
+    model = PointCloudSimplifier(M=args.M, k=args.k, alpha=args.alpha, threshold=args.threshold, lambda_1=args.lambda_1, lambda_2=args.lambda_2, lambda_3=args.lambda_3, lambda_4=args.lambda_4, num_class=args.num_class, lambda_cls=args.lambda_cls).to(device)
 
     assert args.resume is not None, "Test mode butuh --resume path/ke/checkpoint.pth"
     ckpt  = torch.load(args.resume, map_location=device)
@@ -355,7 +359,7 @@ def run_test(args: argparse.Namespace) -> None:
     print(f"[test] Loaded checkpoint: {args.resume}")
 
     model.eval()
-    totals = {"total": 0.0, "chamfer": 0.0, "normal": 0.0, "nc": 0.0, "score": 0.0}
+    totals = {"total": 0.0, "chamfer": 0.0, "normal": 0.0, "nc": 0.0, "score": 0.0, "cls": 0.0}
 
     pbar = tqdm(val_loader, desc="[Test]", dynamic_ncols=True)
     for step, (P, _) in enumerate(pbar):
@@ -401,7 +405,7 @@ def ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
                     f"Val: {len(val_loader.dataset)} samples")
 
     # ── Model ─────────────────────────────────────────────────────────
-    model = PointCloudSimplifier(M=args.M, k=args.k, alpha=args.alpha, threshold=args.threshold, lambda_1=args.lambda_1, lambda_2=args.lambda_2, lambda_3=args.lambda_3, lambda_4=args.lambda_4).to(device)
+    model = PointCloudSimplifier(M=args.M, k=args.k, alpha=args.alpha, threshold=args.threshold, lambda_1=args.lambda_1, lambda_2=args.lambda_2, lambda_3=args.lambda_3, lambda_4=args.lambda_4, num_class=args.num_class, lambda_cls=args.lambda_cls).to(device)
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=False)
 
@@ -493,6 +497,7 @@ def ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
                 f"train={train_losses['total']:.4f}  "
                 f"val={val_losses['total']:.4f}  "
                 f"cd_rec={val_losses['chamfer']:.4f}  "
+                f"cls={val_losses['cls']:.4f}  "
                 f"cd_simp={val_losses['cd_simplified']:.4f}  "
                 f"n={val_losses['normal']:.4f}  "
                 f"nc={val_losses['nc']:.4f}  "
@@ -552,6 +557,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda_4",     type=float, default=0.3, help="Weight for score supervision loss")
     parser.add_argument("--alpha",        type=float, default=0.7, help="Contour fraction in selector")
     parser.add_argument("--threshold",    type=float, default=0.5, help="NC threshold contour vs flat")
+    parser.add_argument("--num_class",     type=int,   default=10,  help="Number of classes")
+    parser.add_argument("--lambda_cls",    type=float, default=0.5, help="Weight for classification loss")
     return parser.parse_args()
 
 

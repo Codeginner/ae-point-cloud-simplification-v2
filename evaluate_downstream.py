@@ -293,20 +293,25 @@ class SampleNet(nn.Module):
         ).to(device)
 
     def forward(self, P: Tensor, M: int) -> Tensor:
-        """P:(B,N,3) → (B,M,3) — nearest real point to each projected sample"""
+        """P:(B,N,3) → (B,M,3) — differentiable projection; snapped to nearest real point at eval"""
         B, N, _ = P.shape
         if self._M != M:
             self._build_decoder(M, P.device)
 
-        x   = P.permute(0,2,1)                           # (B,3,N)
-        f   = self.enc(x).max(-1)[0]                     # (B,feat_dim)
-        proj = self._dec(f).view(B, M, 3)                # (B,M,3)
+        x    = P.permute(0, 2, 1)                        # (B,3,N)
+        f    = self.enc(x).max(-1)[0]                    # (B,feat_dim)
+        proj = self._dec(f).view(B, M, 3)                # (B,M,3)  — differentiable
 
-        # Snap to nearest real point (inference)
-        with torch.no_grad():
-            diff = proj.unsqueeze(2) - P.unsqueeze(1)    # (B,M,N,3)
-            idx  = (diff**2).sum(-1).argmin(-1)          # (B,M)
-        return P.gather(1, idx.unsqueeze(-1).expand(-1,-1,3))
+        if not self.training:
+            # At eval: snap projected points to nearest real input point
+            with torch.no_grad():
+                diff = proj.unsqueeze(2) - P.unsqueeze(1)    # (B,M,N,3)
+                idx  = (diff**2).sum(-1).argmin(-1)           # (B,M)
+            return P.gather(1, idx.unsqueeze(-1).expand(-1,-1,3))
+        else:
+            # During training: return projected points directly (differentiable)
+            # so gradient flows back through decoder to encoder
+            return proj
 
 
 # ===========================================================================
@@ -379,37 +384,57 @@ def train_sampler(
     Quick task-driven training for APES/SampleNet.
     Frozen classifier, only sampler trained.
     """
-    model.train()
+    # Freeze classifier FIRST, then build optimizer from sampler params only
     for p in classifier.parameters():
         p.requires_grad_(False)
+    classifier.eval()
 
-    opt = torch.optim.Adam(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=1e-3, weight_decay=1e-4
-    )
-    ce = nn.CrossEntropyLoss()
+    # Ensure all sampler params require grad
+    for p in model.parameters():
+        p.requires_grad_(True)
+    model.train()
+
+    sampler_params = [p for p in model.parameters() if p.requires_grad]
+    if not sampler_params:
+        raise RuntimeError("Sampler has no trainable parameters!")
+
+    opt = torch.optim.Adam(sampler_params, lr=1e-3, weight_decay=1e-4)
+    ce  = nn.CrossEntropyLoss()
 
     for ep in range(epochs):
         total, correct, n = 0.0, 0, 0
         for P, labels in train_loader:
             P, labels = P.to(device), labels.to(device)
             opt.zero_grad()
+
             if isinstance(model, SampleNet):
+                # SampleNet forward — snap is wrapped in no_grad internally
+                # but projection path stays differentiable
                 P_s = model(P, M)
             else:
-                P_s = model(P, M)
+                # APES — scores are differentiable, selection via topk + gather
+                scores = model.get_scores(P)            # (B, N)  — has grad
+                idx    = scores.topk(M, dim=1)[1]       # (B, M)  — integer, no grad
+                # STE: keep values, pass gradient through scores
+                P_s_hard = P.gather(1, idx.unsqueeze(-1).expand(-1, -1, 3))
+                sel_scores = scores.gather(1, idx)      # (B, M)
+                # Additive STE: forward==P_s_hard, backward flows to scores
+                P_s = P_s_hard + (sel_scores.unsqueeze(-1) - sel_scores.unsqueeze(-1).detach())
+
             logits = classifier(P_s)
             loss   = ce(logits, labels)
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            nn.utils.clip_grad_norm_(sampler_params, 1.0)
             opt.step()
             total   += loss.item() * P.shape[0]
             correct += (logits.argmax(-1) == labels).sum().item()
             n       += P.shape[0]
+
         if (ep + 1) % 5 == 0:
             logger.info(f"  sampler training ep {ep+1}/{epochs}  "
                         f"loss={total/n:.4f}  acc={correct/n*100:.1f}%")
 
+    # Unfreeze classifier for subsequent use
     for p in classifier.parameters():
         p.requires_grad_(True)
 

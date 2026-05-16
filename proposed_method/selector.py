@@ -131,7 +131,23 @@ class AdaptiveSelector(nn.Module):
         # ------------------------------------------------------------------
 
         selected_scores = score.gather(1, idx)                          # (B, M)
-        scale = selected_scores / selected_scores.detach().clamp(1e-8)  # (B, M) ≈ 1.0
-        P_s = P_s_hard * scale.unsqueeze(-1)                            # (B, M, 3)
+
+        # ------------------------------------------------------------------
+        # Straight-Through Estimator (STE) — CORRECTED FORMULA
+        #
+        # Previous (wrong):
+        #   scale = s / s.detach().clamp(1e-8)
+        #   P_s   = P_s_hard * scale
+        #   → When scorer outputs small values (near 0), scale ≈ 0
+        #     → P_s collapses toward origin → NaN in loss after a few epochs
+        #
+        # Correct (additive STE):
+        #   P_s = P_s_hard + (s - s.detach())
+        #   Forward : (s - s.detach()) == 0  → P_s == P_s_hard  ✓
+        #   Backward: dL/ds = dL/dP_s        → gradient flows to scorer ✓
+        #   No numerical instability regardless of score magnitude.
+        # ------------------------------------------------------------------
+
+        P_s = P_s_hard + (selected_scores.unsqueeze(-1) - selected_scores.unsqueeze(-1).detach())
 
         return idx, P_s

@@ -134,14 +134,15 @@ def train_one_epoch(
     epoch:      int,
 ) -> dict[str, float]:
     model.train()
-    totals: dict[str, float] = {"total": 0.0, "chamfer": 0.0, "normal": 0.0, "nc": 0.0}
+    totals: dict[str, float] = {"total": 0.0, "chamfer": 0.0, "normal": 0.0, "nc": 0.0, "cls": 0.0}
 
-    for step, (P, _) in enumerate(loader):          # unpack (pcd, label); label tidak dipakai
-        P = P.to(device)                             # (B, N, 3)
+    for step, (P, labels) in enumerate(loader):     # BUG FIX: unpack labels (sebelumnya di-ignore → L_cls=0 selalu)
+        P      = P.to(device)                        # (B, N, 3)
+        labels = labels.to(device)                   # (B,)
 
         optimizer.zero_grad()
 
-        out  = model(P, compute_loss=True)
+        out  = model(P, labels=labels, compute_loss=True)   # BUG FIX: kirim labels ke model
         loss = out["loss"]
 
         # .mean() untuk handle DataParallel yang return tensor per-GPU
@@ -158,7 +159,8 @@ def train_one_epoch(
                 f"loss={loss['total'].mean().item():.4f}  "
                 f"cd={loss['chamfer'].mean().item():.4f}  "
                 f"n={loss['normal'].mean().item():.4f}  "
-                f"nc={loss['nc'].mean().item():.4f}"
+                f"nc={loss['nc'].mean().item():.4f}  "
+                f"cls={loss['cls'].mean().item():.4f}"
             )
 
     n = len(loader)
@@ -176,12 +178,13 @@ def validate(
     device: torch.device,
 ) -> dict[str, float]:
     model.eval()
-    totals: dict[str, float] = {"total": 0.0, "chamfer": 0.0, "normal": 0.0, "nc": 0.0}
+    totals: dict[str, float] = {"total": 0.0, "chamfer": 0.0, "normal": 0.0, "nc": 0.0, "cls": 0.0}
 
-    for P, _ in loader:                              # unpack (pcd, label)
-        P    = P.to(device)
-        out  = model(P, compute_loss=True)
-        loss = out["loss"]
+    for P, labels in loader:                         # BUG FIX: unpack labels (sebelumnya di-ignore)
+        P      = P.to(device)
+        labels = labels.to(device)
+        out    = model(P, labels=labels, compute_loss=True)   # BUG FIX: kirim labels ke model
+        loss   = out["loss"]
         for k, v in loss.items():
             totals[k] += v.mean().item()
 
@@ -247,6 +250,8 @@ def parse_args() -> argparse.Namespace:
                         help="Jumlah point per sampel")
     parser.add_argument("--M",            type=int,   default=512,
                         help="Jumlah output simplified points (harus <= n_points)")
+    parser.add_argument("--num_class",    type=int,   default=10,
+                        help="Jumlah kelas klasifikasi")
     parser.add_argument("--k",            type=int,   default=20,
                         help="KNN neighbours")
     parser.add_argument("--epochs",       type=int,   default=200)
@@ -279,7 +284,7 @@ def main() -> None:
     logger.info(f"Train: {len(train_ds)} samples | Val: {len(val_ds)} samples")
 
     # ── Model ─────────────────────────────────────────────────────────
-    model = PointCloudSimplifier(M=args.M, k=args.k)
+    model = PointCloudSimplifier(M=args.M, k=args.k, num_class=args.num_class)
 
     if torch.cuda.device_count() > 1:
         logger.info(f"Pakai {torch.cuda.device_count()} GPU via DataParallel")

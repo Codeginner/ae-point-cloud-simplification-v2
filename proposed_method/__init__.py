@@ -21,7 +21,8 @@ from .nc_score import NCScoreModule
 from .scoring  import ImportanceScoringMLP
 from .selector import AdaptiveSelector
 from .decoder  import FoldingNetDecoder
-#from .visualize import visualize_point_clouds
+#from .visualize import visualize_point_clouds  # modul visualize tidak dipakai secara langsung
+                                                 # gunakan matplotlib langsung (lihat train.py)
 from .loss     import (
     GeometryAwareLoss,
     ChamferLoss,
@@ -41,5 +42,5 @@ __all__ = [
     "ChamferLoss",
     "NormalConsistencyLoss",
     "NCScorePreservLoss",
-    "visualize_point_clouds",
+    # "visualize_point_clouds",  # BUG FIX: dihapus dari __all__ karena importnya di-comment
 ]

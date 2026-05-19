@@ -362,9 +362,10 @@ def run_test(args: argparse.Namespace) -> None:
     totals = {"total": 0.0, "chamfer": 0.0, "normal": 0.0, "nc": 0.0, "score": 0.0, "cls": 0.0}
 
     pbar = tqdm(val_loader, desc="[Test]", dynamic_ncols=True)
-    for step, (P, _) in enumerate(pbar):
-        P    = P.to(device)
-        out  = model(P, compute_loss=True)
+    for step, (P, labels) in enumerate(pbar):          # BUG FIX: unpack labels (sebelumnya di-ignore)
+        P      = P.to(device)
+        labels = labels.to(device)                      # BUG FIX: kirim labels ke model
+        out    = model(P, labels=labels, compute_loss=True)
         loss = out["loss"]
         for k, v in loss.items():
             totals[k] += v.item()
@@ -573,7 +574,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size",   type=int,   default=16,
                         help="Batch size PER GPU")
     parser.add_argument("--lr",           type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=0.1)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)   # BUG FIX: 0.1 → 1e-4 (terlalu agresif)
     parser.add_argument("--num_workers",  type=int,   default=4)
     parser.add_argument("--checkpoint",   type=str,   default="./checkpoints")
     parser.add_argument("--resume",       type=str,   default=None)

@@ -58,18 +58,18 @@ class PointCloudDataset(Dataset):
         self.augment  = augment and (mode == 'train')
 
         import glob
-        pcd_dir   = os.path.join(data_root, 'modelnet10', 'pcd',   mode)
-        label_dir = os.path.join(data_root, 'modelnet10', 'label', mode)
+        pcd_dir   = os.path.join(data_root, 'modelnet40', 'pcd',   mode)
+        label_dir = os.path.join(data_root, 'modelnet40', 'label', mode)
 
         self.pcd_files   = sorted(glob.glob(os.path.join(pcd_dir,   '*.npy')))
         self.label_files = sorted(glob.glob(os.path.join(label_dir, '*.npy')))
 
         assert len(self.pcd_files) > 0, \
-            f"Tidak ada file di {pcd_dir}. Jalankan download_modelnet10.py dulu."
+            f"Tidak ada file di {pcd_dir}. Jalankan download_modelnet40.py dulu."
         assert len(self.pcd_files) == len(self.label_files), \
             "Jumlah file pcd dan label tidak sama."
 
-        logger.info(f"ModelNet10 [{mode}]: {len(self.pcd_files)} samples, "
+        logger.info(f"ModelNet40 [{mode}]: {len(self.pcd_files)} samples, "
                     f"n_points={n_points}, augment={self.augment}")
 
     def __len__(self) -> int:
@@ -245,7 +245,7 @@ def visualize_results(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PointCloudSimplifier")
     parser.add_argument("--data_root",    type=str,   default="./data",
-                        help="Root folder data (berisi modelnet10/)")
+                        help="Root folder data (berisi modelnet40/)")
     parser.add_argument("--n_points",     type=int,   default=1024,
                         help="Jumlah point per sampel")
     parser.add_argument("--M",            type=int,   default=512,

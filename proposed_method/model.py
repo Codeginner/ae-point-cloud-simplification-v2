@@ -40,26 +40,47 @@ class ClsHead(nn.Module):
     """
     Classification head over simplified point features.
 
-    Uses global max+mean pooling over f_s then a 2-layer MLP.
-    Deliberately lightweight — the heavy lifting is done by the DGCNN encoder.
+    Upgrade dari versi sebelumnya (global max+mean pool -> MLP):
+    Sekarang pakai:
+      1. Self-attention layer untuk capture inter-point context
+      2. Multi-scale pooling: max + mean + std  (3x richer descriptor)
+      3. 3-layer MLP dengan BN + dropout
 
     Args:
-        in_dim    : feature dimension from encoder (448)
-        num_class : number of output classes
+        in_dim    : feature dimension dari encoder (448)
+        num_class : jumlah kelas output
         dropout   : dropout rate
     """
-    def __init__(self, in_dim: int = 448, num_class: int = 10, dropout: float = 0.4):
+    def __init__(self, in_dim: int = 448, num_class: int = 10, dropout: float = 0.5):
         super().__init__()
+
+        # 1. Self-attention untuk inter-point context
+        self.attn = nn.MultiheadAttention(
+            embed_dim=in_dim,
+            num_heads=8,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.attn_norm = nn.LayerNorm(in_dim)
+
+        # 2. Project setelah attention
+        self.proj = nn.Sequential(
+            nn.Linear(in_dim, in_dim, bias=False),
+            nn.LayerNorm(in_dim),
+            nn.GELU(),
+        )
+
+        # 3. MLP: input = max+mean+std pooling = in_dim * 3
+        pool_dim = in_dim * 3
         self.mlp = nn.Sequential(
-            # Project pooled features
-            nn.Linear(in_dim * 2, 512, bias=False),
+            nn.Linear(pool_dim, 512, bias=False),
             nn.BatchNorm1d(512),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(512, 256, bias=False),
             nn.BatchNorm1d(256),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Dropout(dropout),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
             nn.Linear(256, num_class),
         )
 
@@ -70,10 +91,20 @@ class ClsHead(nn.Module):
         Returns:
             logits : (B, num_class)
         """
-        # Global descriptor: max + mean pooling over M simplified points
-        g = torch.cat([f_s.max(dim=1).values,
-                       f_s.mean(dim=1)], dim=-1)   # (B, 896)
-        return self.mlp(g)                          # (B, num_class)
+        # 1. Self-attention: setiap point attend ke semua simplified points
+        attn_out, _ = self.attn(f_s, f_s, f_s)        # (B, M, 448)
+        f_s = self.attn_norm(f_s + attn_out)           # residual + norm
+
+        # 2. Project
+        f_s = self.proj(f_s)                           # (B, M, 448)
+
+        # 3. Multi-scale pooling: max + mean + std
+        f_max  = f_s.max(dim=1).values                 # (B, 448)
+        f_mean = f_s.mean(dim=1)                       # (B, 448)
+        f_std  = f_s.std(dim=1)                        # (B, 448)
+        g = torch.cat([f_max, f_mean, f_std], dim=-1)  # (B, 1344)
+
+        return self.mlp(g)                             # (B, num_class)
 
 
 class PointCloudSimplifier(nn.Module):

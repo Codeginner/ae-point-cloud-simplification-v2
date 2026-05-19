@@ -51,13 +51,13 @@ class ClsHead(nn.Module):
         num_class : jumlah kelas output
         dropout   : dropout rate
     """
-    def __init__(self, in_dim: int = 448, num_class: int = 10, dropout: float = 0.2): #nyoba dropout 0.2 instead of 0.5
+    def __init__(self, in_dim: int = 448, num_class: int = 10, dropout: float = 0.5): #nyoba dropout 0.2 instead of 0.5
         super().__init__()
 
         # 1. Self-attention untuk inter-point context
         self.attn = nn.MultiheadAttention(
             embed_dim=in_dim,
-            num_heads=4, # coba 4 instead of 8
+            num_heads=8, # coba 4 instead of 8
             dropout=dropout,
             batch_first=True,
         )

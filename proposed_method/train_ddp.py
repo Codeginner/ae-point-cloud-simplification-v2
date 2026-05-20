@@ -46,6 +46,41 @@ else:
 
 
 # ---------------------------------------------------------------------------
+# PointNet frozen — task network untuk task-aware training
+# ---------------------------------------------------------------------------
+
+class PointNetCls(nn.Module):
+    """PointNet standar (identik dengan evaluate_apes_protocol.py)."""
+    def __init__(self, num_class: int = 40) -> None:
+        super().__init__()
+        self.conv1 = nn.Sequential(nn.Conv1d(3,64,1),    nn.BatchNorm1d(64),   nn.ReLU())
+        self.conv2 = nn.Sequential(nn.Conv1d(64,128,1),  nn.BatchNorm1d(128),  nn.ReLU())
+        self.conv3 = nn.Sequential(nn.Conv1d(128,1024,1), nn.BatchNorm1d(1024), nn.ReLU())
+        self.fc = nn.Sequential(
+            nn.Linear(1024,512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(512,256),  nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(256, num_class),
+        )
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.permute(0,2,1)
+        x = self.conv3(self.conv2(self.conv1(x)))
+        x = x.max(dim=-1).values
+        return self.fc(x)
+
+
+def load_pointnet_frozen(ckpt_path: str, num_class: int, device: torch.device) -> PointNetCls:
+    """Load PointNet dan freeze semua parameternya."""
+    pn = PointNetCls(num_class=num_class).to(device)
+    ckpt = torch.load(ckpt_path, map_location=device)
+    state = ckpt.get("model", ckpt.get("model_state_dict", ckpt))
+    pn.load_state_dict(state)
+    pn.eval()
+    for p in pn.parameters():
+        p.requires_grad_(False)
+    return pn
+
+
+# ---------------------------------------------------------------------------
 # Logging — hanya rank 0 yang print supaya tidak berantakan
 # ---------------------------------------------------------------------------
 
@@ -151,11 +186,15 @@ def train_one_epoch(
     rank: int,
     world_size: int,
     logger: logging.Logger,
+    pointnet: "PointNetCls | None" = None,
+    lambda_task: float = 1.0,
 ) -> dict[str, float]:
 
     from tqdm import tqdm
 
     model.train()
+    if pointnet is not None:
+        pointnet.eval()   # selalu frozen
     sampler.set_epoch(epoch)
 
     totals = {
@@ -165,6 +204,7 @@ def train_one_epoch(
         "nc": 0.0,
         "score": 0.0,
         "cls": 0.0,
+        "task": 0.0,     # PointNet task-aware loss
     }
     # ONE EPOCH = ONE LINE
     pbar = tqdm(
@@ -185,6 +225,16 @@ def train_one_epoch(
 
         out = model(P, labels, compute_loss=True)
         loss = out["loss"]
+
+        # ── Task-aware loss: gradient langsung dari PointNet frozen ────
+        if pointnet is not None:
+            P_s    = out["P_simplified"]                       # (B, M, 3)
+            logits = pointnet(P_s)                             # (B, num_class)
+            L_task = nn.functional.cross_entropy(logits, labels)
+            loss["task"]  = L_task
+            loss["total"] = loss["total"] + lambda_task * L_task
+        else:
+            loss["task"] = torch.tensor(0.0, device=device)
 
         # Guard: skip batch if loss is NaN/Inf (e.g. degenerate point cloud)
         if not torch.isfinite(loss["total"]):
@@ -225,6 +275,7 @@ def train_one_epoch(
                 "cd":   f"{avg_cd:.4f}",
                 "n":    f"{avg_n:.4f}",
                 "nc":   f"{avg_nc:.4f}",
+                "task": f"{totals['task'] / (step + 1):.4f}",
             })
 
             pbar.update(1)
@@ -249,6 +300,8 @@ def validate(
     rank:       int,
     epoch:      int,
     total_epochs: int,
+    pointnet: "PointNetCls | None" = None,
+    lambda_task: float = 1.0,
 ) -> dict[str, float]:
 
     from tqdm import tqdm
@@ -261,13 +314,11 @@ def validate(
         "normal": 0.0,
         "nc": 0.0,
         "score": 0.0,
-        # BUG FIX: track CD(P_simplified, P_input) separately.
-        # The existing "chamfer" measures CD(P_recon, P_input) which was
-        # misleadingly low even when the visual quality was bad.
-        # "cd_simplified" measures how well the SELECTOR preserves the
-        # original shape — this is the true simplification quality metric.
         "cd_simplified": 0.0,
         "cls": 0.0,
+        "task": 0.0,
+        "task_correct": 0.0,
+        "task_total":   0.0,
     }
 
     pbar = tqdm(
@@ -287,46 +338,57 @@ def validate(
         out = model(P, labels, compute_loss=True)
         loss = out["loss"]
 
+        # ── Task-aware validation (PointNet OA) ───────────────────────
+        P_s = out["P_simplified"]   # (B, M, 3)
+        if pointnet is not None:
+            logits = pointnet(P_s)
+            L_task = nn.functional.cross_entropy(logits, labels)
+            loss["task"]  = L_task
+            loss["total"] = loss["total"] + lambda_task * L_task
+            totals["task_correct"] += (logits.argmax(1) == labels).sum().item()
+            totals["task_total"]   += labels.size(0)
+        else:
+            loss["task"] = torch.tensor(0.0, device=device)
+
         for k, v in loss.items():
             totals[k] += v.item()
 
-        # BUG FIX: compute CD(P_simplified, P_input) every val step
-        with torch.no_grad():
-            P_s   = out["P_simplified"]   # (B, M, 3)
-            # pairwise dist: P_s -> P
-            diff  = P_s.unsqueeze(2) - P.unsqueeze(1)          # (B,M,N,3)
-            d2    = (diff ** 2).sum(-1)                         # (B,M,N)
-            s2p   = d2.min(dim=2).values.mean()                 # scalar: simp→orig
-            # pairwise dist: P -> P_s
-            diff2 = P.unsqueeze(2) - P_s.unsqueeze(1)          # (B,N,M,3)
-            d2b   = (diff2 ** 2).sum(-1)                        # (B,N,M)
-            p2s   = d2b.min(dim=2).values.mean()                # scalar: orig→simp
-            totals["cd_simplified"] += (s2p + p2s).item()
+        # CD(P_simplified, P_input)
+        diff  = P_s.unsqueeze(2) - P.unsqueeze(1)
+        d2    = (diff ** 2).sum(-1)
+        s2p   = d2.min(dim=2).values.mean()
+        diff2 = P.unsqueeze(2) - P_s.unsqueeze(1)
+        d2b   = (diff2 ** 2).sum(-1)
+        p2s   = d2b.min(dim=2).values.mean()
+        totals["cd_simplified"] += (s2p + p2s).item()
 
         if rank == 0:
-
             avg_total   = totals["total"]  / (step + 1)
-            avg_cd      = totals["chamfer"] / (step + 1)
             avg_cd_simp = totals["cd_simplified"] / (step + 1)
-
+            task_oa     = (totals["task_correct"] / totals["task_total"] * 100
+                           if totals["task_total"] > 0 else 0.0)
             pbar.set_postfix({
                 "loss":    f"{avg_total:.4f}",
-                "cd_rec":  f"{avg_cd:.4f}",
                 "cd_simp": f"{avg_cd_simp:.4f}",
+                "pn_oa":   f"{task_oa:.1f}%",
             })
-
             pbar.update(1)
 
     pbar.close()
 
     n = len(loader)
-
     local_avgs = {
-        k: torch.tensor(v / n, device=device)
+        k: torch.tensor(v / n if k not in ("task_correct", "task_total") else v,
+                        device=device)
         for k, v in totals.items()
     }
-
     reduced = reduce_dict(local_avgs, world_size)
+
+    # Hitung OA dari accumulated correct/total (bukan rata-rata per batch)
+    if totals["task_total"] > 0:
+        reduced["pointnet_oa"] = totals["task_correct"] / totals["task_total"] * 100
+    else:
+        reduced["pointnet_oa"] = 0.0
 
     return reduced
 
@@ -408,6 +470,14 @@ def ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         logger.info(f"Train: {len(train_loader.dataset)} samples | "
                     f"Val: {len(val_loader.dataset)} samples")
 
+    # ── PointNet frozen (task-aware training) ─────────────────────────
+    pointnet = None
+    if args.pointnet_ckpt is not None:
+        pointnet = load_pointnet_frozen(args.pointnet_ckpt, args.num_class, device)
+        if rank == 0:
+            logger.info(f"PointNet frozen loaded: {args.pointnet_ckpt}  "
+                        f"lambda_task={args.lambda_task}")
+
     # ── Model ─────────────────────────────────────────────────────────
     model = PointCloudSimplifier(M=args.M, k=args.k, alpha=args.alpha, threshold=args.threshold, lambda_1=args.lambda_1, lambda_2=args.lambda_2, lambda_3=args.lambda_3, lambda_4=args.lambda_4, num_class=args.num_class, lambda_cls=args.lambda_cls).to(device)
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -476,9 +546,11 @@ def ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         train_losses = train_one_epoch(
             model, train_loader, train_sampler,
             optimizer, device, epoch, args.epochs, rank, world_size, logger,
+            pointnet=pointnet, lambda_task=args.lambda_task,
         )
         val_losses = validate(
             model, val_loader, device, world_size, rank, epoch, args.epochs,
+            pointnet=pointnet, lambda_task=args.lambda_task,
         )
         '''
         if rank == 0 and epoch % 10 == 0:
@@ -536,6 +608,26 @@ def ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
 
             # Save checkpoint
             state_dict = model.module.state_dict()
+
+            pn_oa = val_losses.get("pointnet_oa", 0.0)
+            epoch_pbar.set_postfix({
+                "train": f"{train_losses['total']:.4f}",
+                "val":   f"{val_losses['total']:.4f}",
+                "pn_oa": f"{pn_oa:.1f}%",
+                "lr":    f"{lr_now:.1e}",
+            })
+
+            logger.info(
+                f"[Epoch {epoch+1}/{args.epochs}]  "
+                f"train={train_losses['total']:.4f}  "
+                f"val={val_losses['total']:.4f}  "
+                f"cd_simp={val_losses['cd_simplified']:.4f}  "
+                f"n={val_losses['normal']:.4f}  "
+                f"nc={val_losses['nc']:.4f}  "
+                f"pn_oa={pn_oa:.2f}%  "
+                f"lr={lr_now:.2e}"
+            )
+
             torch.save({
                 "epoch":         epoch,
                 "model":         state_dict,
@@ -543,13 +635,21 @@ def ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
                 "scheduler":     scheduler.state_dict(),
                 "val_loss":      val_losses,
                 "best_val_loss": best_val_loss,
+                "pointnet_oa":   pn_oa,
                 "args":          vars(args),
             }, ckpt_dir / "latest.pth")
 
-            if val_losses["total"] < best_val_loss:
-                best_val_loss = val_losses["total"]
-                torch.save(state_dict, ckpt_dir / "best.pth")
-                logger.info(f"  ★ New best val loss: {best_val_loss:.4f}")
+            # Best model: pakai PointNet OA kalau ada, else val loss
+            if pointnet is not None:
+                if pn_oa > best_val_loss:
+                    best_val_loss = pn_oa
+                    torch.save(state_dict, ckpt_dir / "best.pth")
+                    logger.info(f"  ★ New best PointNet OA: {best_val_loss:.2f}%")
+            else:
+                if val_losses["total"] < best_val_loss:
+                    best_val_loss = val_losses["total"]
+                    torch.save(state_dict, ckpt_dir / "best.pth")
+                    logger.info(f"  ★ New best val loss: {best_val_loss:.4f}")
 
         dist.barrier()
 
@@ -618,6 +718,21 @@ def parse_args() -> argparse.Namespace:
     train_grp.add_argument("--num_workers",  type=int,   default=4)
     train_grp.add_argument("--checkpoint",   type=str,   default="./checkpoints")
     train_grp.add_argument("--resume",       type=str,   default=None)
+
+    # ── Task-aware training (PointNet frozen) ─────────────────────────
+    task_grp = parser.add_argument_group("Task-aware training")
+    task_grp.add_argument(
+        "--pointnet_ckpt", type=str, default=None,
+        help=(
+            "Path ke pretrained PointNet checkpoint. "
+            "Jika di-set, simplifier ditraining dengan gradient langsung dari "
+            "PointNet frozen — ini yang paling efektif untuk naikkan OA eval."
+        ),
+    )
+    task_grp.add_argument(
+        "--lambda_task", type=float, default=1.0,
+        help="Weight untuk task-aware loss dari PointNet frozen.",
+    )
 
     # ── Loss weights ──────────────────────────────────────────────────
     loss_grp = parser.add_argument_group("Loss weights")

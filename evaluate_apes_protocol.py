@@ -31,19 +31,18 @@ Cara dapat pretrained PointNet:
 """
 
 import argparse
-import glob
 import sys
 import logging
 from pathlib import Path
 
-import h5py
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from proposed_method.model import PointCloudSimplifier
+from proposed_method.train import PointCloudDataset, DATASET_CONFIG, SUPPORTED_DATASETS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -86,51 +85,13 @@ class PointNetCls(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# ModelNet40 HDF5 Dataset (format standar APES / SampleNet)
+# Dataset — pakai PointCloudDataset yang sudah ada (format .npy)
 # ---------------------------------------------------------------------------
-
-class ModelNet40H5(Dataset):
-    """Baca ModelNet40 dari file HDF5 (modelnet40_ply_hdf5_2048).
-
-    Struktur folder:
-        data_root/ply_data_train0.h5
-        data_root/ply_data_train1.h5
-        ...
-        data_root/ply_data_test0.h5
-        data_root/ply_data_test1.h5
-    """
-
-    def __init__(self, data_root: str, split: str = "test", n_points: int = 1024) -> None:
-        assert split in ("train", "test"), "split harus 'train' atau 'test'"
-        self.n_points = n_points
-
-        files = sorted(glob.glob(f"{data_root}/ply_data_{split}*.h5"))
-        assert len(files) > 0, (
-            f"Tidak ada file HDF5 di {data_root} untuk split '{split}'. "
-            "Pastikan sudah download modelnet40_ply_hdf5_2048."
-        )
-
-        all_data, all_labels = [], []
-        for f in files:
-            with h5py.File(f, "r") as h:
-                all_data.append(h["data"][:])    # (n, 2048, 3)
-                all_labels.append(h["label"][:]) # (n, 1)
-
-        self.data   = np.concatenate(all_data,   axis=0).astype("float32")  # (N, 2048, 3)
-        self.labels = np.concatenate(all_labels, axis=0).squeeze().astype("int64")  # (N,)
-
-        logger.info(f"ModelNet40 [{split}]: {len(self.data)} samples, n_points={n_points}")
-
-    def __len__(self) -> int:
-        return len(self.data)
-
-    def __getitem__(self, i: int):
-        pts = self.data[i][: self.n_points]          # (n_points, 3)
-        # Normalisasi: zero-mean + unit sphere (sama dengan training)
-        pts -= pts.mean(axis=0)
-        scale = np.max(np.linalg.norm(pts, axis=1))
-        pts  /= (scale + 1e-8)
-        return torch.FloatTensor(pts), int(self.labels[i])
+# PointCloudDataset membaca dari:
+#   data_root/{dataset}/pcd/{train,test}/*.npy   — (2048, 3)
+#   data_root/{dataset}/label/{train,test}/*.npy — scalar label
+# Ini adalah format yang dihasilkan download_modelnet40.py di repo ini.
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -198,8 +159,10 @@ def parse_args() -> argparse.Namespace:
                    help="Path ke checkpoint simplifier lo (best.pth)")
     p.add_argument("--pointnet_ckpt", required=True,
                    help="Path ke pretrained PointNet checkpoint (.pth)")
-    p.add_argument("--data_root",     default="./data/modelnet40_ply_hdf5_2048",
-                   help="Folder HDF5 ModelNet40")
+    p.add_argument("--data_root",     default="./data",
+                   help="Root folder data (berisi sub-folder modelnet40/ atau modelnet10/)")
+    p.add_argument("--dataset",       default="modelnet40", choices=SUPPORTED_DATASETS,
+                   help="Dataset yang dipakai")
 
     # ── Model ─────────────────────────────────────────────────────────
     p.add_argument("--M",      type=int, default=None,
@@ -244,11 +207,19 @@ def main() -> None:
     np.random.seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Device: {device}  |  TTA: {args.tta}")
+    logger.info(f"Device: {device}  |  TTA: {args.tta}  |  dataset: {args.dataset}")
 
-    # ── Dataset ───────────────────────────────────────────────────────
-    test_ds = ModelNet40H5(args.data_root, split="test", n_points=args.n_points)
-    loader  = DataLoader(
+    # ── Dataset — pakai PointCloudDataset (format .npy) ──────────────
+    cfg = DATASET_CONFIG[args.dataset]
+    if args.num_class == 40 and cfg["num_class"] != 40:
+        # auto-correct kalau user lupa ganti --num_class
+        args.num_class = cfg["num_class"]
+    test_ds = PointCloudDataset(
+        data_root=args.data_root, mode="test",
+        n_points=args.n_points, augment=False,
+        dataset=args.dataset,
+    )
+    loader = DataLoader(
         test_ds, batch_size=args.batch_size,
         shuffle=False, num_workers=args.num_workers, pin_memory=True,
     )

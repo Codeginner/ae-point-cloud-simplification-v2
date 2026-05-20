@@ -38,11 +38,13 @@ from torch.utils.data import DataLoader, DistributedSampler
 # Import dari package — support run sebagai script langsung maupun modul
 if __package__:
     from .model  import PointCloudSimplifier
-    from .train  import PointCloudDataset, DATASET_CONFIG, SUPPORTED_DATASETS, _resolve_num_class
+    from .train  import (PointCloudDataset, ModelNet40H5, build_dataset,
+                         DATASET_CONFIG, SUPPORTED_DATASETS, _resolve_num_class)
 else:
     sys.path.insert(0, str(Path(__file__).parent.parent))
     from proposed_method.model import PointCloudSimplifier
-    from proposed_method.train import PointCloudDataset, DATASET_CONFIG, SUPPORTED_DATASETS, _resolve_num_class
+    from proposed_method.train import (PointCloudDataset, ModelNet40H5, build_dataset,
+                                       DATASET_CONFIG, SUPPORTED_DATASETS, _resolve_num_class)
 
 
 # ---------------------------------------------------------------------------
@@ -122,15 +124,15 @@ def cleanup_ddp() -> None:
 # ---------------------------------------------------------------------------
 
 def build_loaders(args: argparse.Namespace, rank: int, world_size: int):
-    train_ds = PointCloudDataset(
-        data_root=args.data_root, mode='train',
+    train_ds = build_dataset(
+        data_root=args.data_root, mode="train",
         n_points=args.n_points,   augment=True,
-        dataset=args.dataset,
+        dataset=args.dataset,     data_format=args.data_format,
     )
-    val_ds = PointCloudDataset(
-        data_root=args.data_root, mode='test',
+    val_ds = build_dataset(
+        data_root=args.data_root, mode="test",
         n_points=args.n_points,   augment=False,
-        dataset=args.dataset,
+        dataset=args.dataset,     data_format=args.data_format,
     )
 
     # DistributedSampler: tiap GPU hanya lihat subset data-nya sendiri
@@ -686,8 +688,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     dataset_grp.add_argument(
+        "--data_format", type=str, default="npy",
+        choices=["npy", "hdf5"],
+        help=(
+            "'npy'  = format repo ini (data/modelnet40/pcd/). "
+            "'hdf5' = format official APES/SampleNet (modelnet40_ply_hdf5_2048/). "
+            "HDF5 hanya tersedia untuk modelnet40."
+        ),
+    )
+    dataset_grp.add_argument(
         "--data_root", type=str, default="./data",
-        help="Root folder data. Harus berisi sub-folder sesuai --dataset.",
+        help="Root folder data. Untuk --data_format hdf5, arahkan langsung ke "
+             "modelnet40_ply_hdf5_2048/.",
     )
 
     # ── Model ─────────────────────────────────────────────────────────

@@ -6,6 +6,7 @@ Usage:
 """
 import os
 import argparse
+import glob
 import logging
 from pathlib import Path
 import torch
@@ -15,6 +16,7 @@ from .model import PointCloudSimplifier
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -160,6 +162,97 @@ class PointCloudDataset(Dataset):
         """Tambahkan Gaussian noise kecil ke setiap point."""
         noise = torch.clamp(torch.randn_like(pcd) * sigma, -clip, clip)
         return pcd + noise
+
+
+# ---------------------------------------------------------------------------
+# HDF5 Dataset — format official APES/SampleNet (modelnet40_ply_hdf5_2048)
+# ---------------------------------------------------------------------------
+
+class ModelNet40H5(Dataset):
+    """Baca ModelNet40 dari file HDF5 (format official APES/SampleNet).
+
+    Struktur folder:
+        data_root/ply_data_train*.h5
+        data_root/ply_data_test*.h5
+
+    Preprocessing identik dengan PointCloudDataset: zero-mean + unit sphere.
+    """
+
+    def __init__(
+        self,
+        data_root: str,
+        mode:      str  = "train",
+        n_points:  int  = 1024,
+        augment:   bool = True,
+    ) -> None:
+        import h5py
+        assert mode in ("train", "test"), "mode harus 'train' atau 'test'"
+        self.n_points = n_points
+        self.augment  = augment and (mode == "train")
+        self.num_class = 40
+
+        files = sorted(glob.glob(f"{data_root}/ply_data_{mode}*.h5"))
+        assert files, (
+            f"Tidak ada file .h5 di {data_root} untuk split '{mode}'. "
+            "Pastikan --data_root menunjuk ke modelnet40_ply_hdf5_2048/."
+        )
+
+        all_data, all_labels = [], []
+        for f in files:
+            with h5py.File(f, "r") as h:
+                all_data.append(h["data"][:])    # (n, 2048, 3)
+                all_labels.append(h["label"][:]) # (n, 1)
+
+        self.data   = np.concatenate(all_data,   axis=0).astype("float32")
+        self.labels = np.concatenate(all_labels, axis=0).squeeze().astype("int64")
+        logger.info(
+            f"HDF5 ModelNet40 [{mode}]: {len(self.data)} samples, "
+            f"n_points={n_points}, augment={self.augment}"
+        )
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __getitem__(self, i: int):
+        pts = self.data[i][: self.n_points].copy()
+
+        # Normalisasi: zero-mean + unit sphere (sama dengan PointCloudDataset)
+        pts -= pts.mean(axis=0)
+        pts /= (np.max(np.linalg.norm(pts, axis=1)) + 1e-8)
+
+        if self.augment:
+            # Random rotation (Y-axis)
+            theta  = np.random.uniform(0, 2 * np.pi)
+            c, s   = np.cos(theta), np.sin(theta)
+            R      = np.array([[c,0,s],[0,1,0],[-s,0,c]], dtype="float32")
+            pts    = pts @ R.T
+            # Jitter
+            pts   += np.clip(np.random.randn(*pts.shape) * 0.01, -0.05, 0.05).astype("float32")
+
+        return torch.FloatTensor(pts), int(self.labels[i])
+
+
+def build_dataset(
+    data_root:   str,
+    mode:        str,
+    n_points:    int,
+    augment:     bool,
+    dataset:     str  = "modelnet40",
+    data_format: str  = "npy",
+) -> Dataset:
+    """Factory: pilih dataset berdasarkan --data_format.
+
+    Args:
+        data_format: 'npy'  → PointCloudDataset (format repo ini)
+                     'hdf5' → ModelNet40H5 (format official APES/SampleNet)
+    """
+    if data_format == "hdf5":
+        assert dataset == "modelnet40", \
+            "Format HDF5 hanya tersedia untuk modelnet40."
+        return ModelNet40H5(data_root, mode=mode, n_points=n_points, augment=augment)
+    else:
+        return PointCloudDataset(data_root, mode=mode, n_points=n_points,
+                                 augment=augment, dataset=dataset)
 
 
 # ---------------------------------------------------------------------------

@@ -21,20 +21,46 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 
 # ---------------------------------------------------------------------------
-# ModelNet10 Dataset
+# Dataset config — ModelNet10 & ModelNet40
 # ---------------------------------------------------------------------------
 
-SUBSET_CLASSES = [
-    'bathtub', 'bed', 'chair', 'desk', 'dresser',
-    'monitor', 'night_stand', 'sofa', 'table', 'toilet'
-]
+DATASET_CONFIG = {
+    "modelnet10": {
+        "subfolder":  "modelnet10",
+        "num_class":  10,
+        "classes": [
+            "bathtub", "bed", "chair", "desk", "dresser",
+            "monitor", "night_stand", "sofa", "table", "toilet",
+        ],
+        "download_script": "script/download_modelnet10.py",
+    },
+    "modelnet40": {
+        "subfolder":  "modelnet40",
+        "num_class":  40,
+        "classes": [
+            "airplane", "bathtub", "bed", "bench", "bookshelf",
+            "bottle", "bowl", "car", "chair", "cone",
+            "cup", "curtain", "desk", "door", "dresser",
+            "flower_pot", "glass_box", "guitar", "keyboard", "lamp",
+            "laptop", "mantel", "monitor", "night_stand", "person",
+            "piano", "plant", "radio", "range_hood", "sink",
+            "sofa", "stairs", "stool", "table", "tent",
+            "toilet", "tv_stand", "vase", "wardrobe", "xbox",
+        ],
+        "download_script": "script/download_modelnet40.py",
+    },
+}
+
+SUPPORTED_DATASETS = tuple(DATASET_CONFIG.keys())
+
 
 class PointCloudDataset(Dataset):
-    """ModelNet10 subset dataset.
+    """Dataset point cloud untuk ModelNet10 atau ModelNet40.
 
-    Membaca file .npy hasil download_modelnet10.py dengan struktur:
-        data_root/modelnet10/pcd/{mode}/0000.npy    — (2048, 3)
-        data_root/modelnet10/label/{mode}/0000.npy  — scalar 0-9
+    Membaca file .npy yang dihasilkan script download_modelnet{10,40}.py
+    dengan struktur:
+        data_root/{dataset}/pcd/{mode}/0000.npy    — (2048, 3)
+        data_root/{dataset}/label/{mode}/0000.npy  — scalar label
 
     Args:
         data_root:  Root folder data, default './data'.
@@ -43,6 +69,7 @@ class PointCloudDataset(Dataset):
                     dilakukan random sampling. Default 1024.
         augment:    Aktifkan augmentasi (random rotation + jitter)
                     saat training. Default True.
+        dataset:    'modelnet10' atau 'modelnet40'. Default 'modelnet40'.
     """
 
     def __init__(
@@ -51,26 +78,39 @@ class PointCloudDataset(Dataset):
         mode:      str  = 'train',
         n_points:  int  = 1024,
         augment:   bool = True,
+        dataset:   str  = 'modelnet40',
     ) -> None:
         super().__init__()
         assert mode in ('train', 'test'), "mode harus 'train' atau 'test'"
+        assert dataset in SUPPORTED_DATASETS, \
+            f"dataset harus salah satu dari {SUPPORTED_DATASETS}, dapat: '{dataset}'"
+
         self.n_points = n_points
         self.augment  = augment and (mode == 'train')
+        self.dataset  = dataset
+
+        cfg        = DATASET_CONFIG[dataset]
+        subfolder  = cfg["subfolder"]
+        self.num_class = cfg["num_class"]
 
         import glob
-        pcd_dir   = os.path.join(data_root, 'modelnet40', 'pcd',   mode)
-        label_dir = os.path.join(data_root, 'modelnet40', 'label', mode)
+        pcd_dir   = os.path.join(data_root, subfolder, 'pcd',   mode)
+        label_dir = os.path.join(data_root, subfolder, 'label', mode)
 
         self.pcd_files   = sorted(glob.glob(os.path.join(pcd_dir,   '*.npy')))
         self.label_files = sorted(glob.glob(os.path.join(label_dir, '*.npy')))
 
-        assert len(self.pcd_files) > 0, \
-            f"Tidak ada file di {pcd_dir}. Jalankan download_modelnet40.py dulu."
+        assert len(self.pcd_files) > 0, (
+            f"Tidak ada file di {pcd_dir}. "
+            f"Jalankan {cfg['download_script']} terlebih dahulu."
+        )
         assert len(self.pcd_files) == len(self.label_files), \
             "Jumlah file pcd dan label tidak sama."
 
-        logger.info(f"ModelNet40 [{mode}]: {len(self.pcd_files)} samples, "
-                    f"n_points={n_points}, augment={self.augment}")
+        logger.info(
+            f"{dataset.upper()} [{mode}]: {len(self.pcd_files)} samples, "
+            f"num_class={self.num_class}, n_points={n_points}, augment={self.augment}"
+        )
 
     def __len__(self) -> int:
         return len(self.pcd_files)
@@ -242,39 +282,92 @@ def visualize_results(
 # Main training script
 # ---------------------------------------------------------------------------
 
+def _resolve_num_class(args: argparse.Namespace) -> argparse.Namespace:
+    """Isi num_class otomatis dari DATASET_CONFIG jika belum di-set eksplisit."""
+    cfg = DATASET_CONFIG[args.dataset]
+    if args.num_class is None:
+        args.num_class = cfg["num_class"]
+        logger.info(
+            f"num_class di-set otomatis ke {args.num_class} "
+            f"sesuai dataset '{args.dataset}'"
+        )
+    elif args.num_class != cfg["num_class"]:
+        logger.warning(
+            f"num_class={args.num_class} berbeda dari default dataset "
+            f"'{args.dataset}' ({cfg['num_class']}). "
+            "Pastikan ini disengaja (misal: subset kelas)."
+        )
+    return args
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train PointCloudSimplifier")
-    parser.add_argument("--data_root",    type=str,   default="./data",
-                        help="Root folder data (berisi modelnet40/)")
-    parser.add_argument("--n_points",     type=int,   default=1024,
-                        help="Jumlah point per sampel")
-    parser.add_argument("--M",            type=int,   default=512,
-                        help="Jumlah output simplified points (harus <= n_points)")
-    parser.add_argument("--num_class",    type=int,   default=10,
-                        help="Jumlah kelas klasifikasi")
-    parser.add_argument("--k",            type=int,   default=20,
-                        help="KNN neighbours")
-    parser.add_argument("--epochs",       type=int,   default=200)
-    parser.add_argument("--batch_size",   type=int,   default=16)
-    parser.add_argument("--lr",           type=float, default=1e-3)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--num_workers",  type=int,   default=4)
-    parser.add_argument("--checkpoint",   type=str,   default="./checkpoints")
-    parser.add_argument("--resume",       type=str,   default=None,
-                        help="Path ke checkpoint untuk resume training")
-    return parser.parse_args()
+    parser = argparse.ArgumentParser(
+        description="Train PointCloudSimplifier",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # ── Dataset ───────────────────────────────────────────────────────
+    dataset_grp = parser.add_argument_group("Dataset")
+    dataset_grp.add_argument(
+        "--dataset", type=str, default="modelnet40",
+        choices=SUPPORTED_DATASETS,
+        help=(
+            "Dataset yang digunakan. "
+            "'modelnet10' = 10 kelas (bathtub, bed, chair, …). "
+            "'modelnet40' = 40 kelas (airplane, bathtub, bed, …). "
+            "num_class di-set otomatis kecuali --num_class di-override secara eksplisit."
+        ),
+    )
+    dataset_grp.add_argument(
+        "--data_root", type=str, default="./data",
+        help="Root folder data. Harus berisi sub-folder sesuai --dataset "
+             "(misal: ./data/modelnet10/ atau ./data/modelnet40/).",
+    )
+
+    # ── Model ─────────────────────────────────────────────────────────
+    model_grp = parser.add_argument_group("Model")
+    model_grp.add_argument("--n_points", type=int, default=1024,
+                           help="Jumlah point per sampel")
+    model_grp.add_argument("--M",        type=int, default=512,
+                           help="Jumlah output simplified points (harus <= n_points)")
+    model_grp.add_argument(
+        "--num_class", type=int, default=None,
+        help=(
+            "Override jumlah kelas. Jika tidak di-set, otomatis mengikuti --dataset "
+            "(modelnet10→10, modelnet40→40)."
+        ),
+    )
+    model_grp.add_argument("--k", type=int, default=20, help="KNN neighbours")
+
+    # ── Training ──────────────────────────────────────────────────────
+    train_grp = parser.add_argument_group("Training")
+    train_grp.add_argument("--epochs",       type=int,   default=200)
+    train_grp.add_argument("--batch_size",   type=int,   default=16)
+    train_grp.add_argument("--lr",           type=float, default=1e-3)
+    train_grp.add_argument("--weight_decay", type=float, default=1e-4)
+    train_grp.add_argument("--num_workers",  type=int,   default=4)
+    train_grp.add_argument("--checkpoint",   type=str,   default="./checkpoints")
+    train_grp.add_argument("--resume",       type=str,   default=None,
+                           help="Path ke checkpoint untuk resume training")
+
+    return _resolve_num_class(parser.parse_args())
 
 
 def main() -> None:
     args   = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Device: {device}  |  GPU count: {torch.cuda.device_count()}")
+    logger.info(
+        f"Device: {device}  |  GPU count: {torch.cuda.device_count()}  |  "
+        f"Dataset: {args.dataset} ({args.num_class} kelas)"
+    )
 
     # ── Data ──────────────────────────────────────────────────────────
     train_ds = PointCloudDataset(data_root=args.data_root, mode='train',
-                                 n_points=args.n_points, augment=True)
+                                 n_points=args.n_points, augment=True,
+                                 dataset=args.dataset)
     val_ds   = PointCloudDataset(data_root=args.data_root, mode='test',
-                                 n_points=args.n_points, augment=False)
+                                 n_points=args.n_points, augment=False,
+                                 dataset=args.dataset)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size,
                               shuffle=True,  num_workers=args.num_workers, pin_memory=True)

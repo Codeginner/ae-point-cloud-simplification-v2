@@ -37,12 +37,12 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 # Import dari package — support run sebagai script langsung maupun modul
 if __package__:
-    from .model   import PointCloudSimplifier
-    from .train   import PointCloudDataset        # reuse dataset dari train.py
+    from .model  import PointCloudSimplifier
+    from .train  import PointCloudDataset, DATASET_CONFIG, SUPPORTED_DATASETS, _resolve_num_class
 else:
     sys.path.insert(0, str(Path(__file__).parent.parent))
     from proposed_method.model import PointCloudSimplifier
-    from proposed_method.train import PointCloudDataset
+    from proposed_method.train import PointCloudDataset, DATASET_CONFIG, SUPPORTED_DATASETS, _resolve_num_class
 
 
 # ---------------------------------------------------------------------------
@@ -90,10 +90,12 @@ def build_loaders(args: argparse.Namespace, rank: int, world_size: int):
     train_ds = PointCloudDataset(
         data_root=args.data_root, mode='train',
         n_points=args.n_points,   augment=True,
+        dataset=args.dataset,
     )
     val_ds = PointCloudDataset(
         data_root=args.data_root, mode='test',
         n_points=args.n_points,   augment=False,
+        dataset=args.dataset,
     )
 
     # DistributedSampler: tiap GPU hanya lihat subset data-nya sendiri
@@ -344,6 +346,7 @@ def run_test(args: argparse.Namespace) -> None:
     val_ds = PointCloudDataset(
         data_root=args.data_root, mode='test',
         n_points=args.n_points,   augment=False,
+        dataset=args.dataset,
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size,
@@ -561,32 +564,72 @@ def ddp_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="DDP Training — PointCloudSimplifier")
-    parser.add_argument("--mode",         type=str,   default="train",
+    parser = argparse.ArgumentParser(
+        description="DDP Training — PointCloudSimplifier",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # ── Mode ──────────────────────────────────────────────────────────
+    parser.add_argument("--mode", type=str, default="train",
                         choices=["train", "test"],
                         help="'train' untuk DDP training, 'test' untuk evaluasi single-GPU")
-    parser.add_argument("--data_root",    type=str,   default="./data")
-    parser.add_argument("--n_points",     type=int,   default=1024)
-    parser.add_argument("--M",            type=int,   default=512,
-                        help="Jumlah simplified output points")
-    parser.add_argument("--k",            type=int,   default=20)
-    parser.add_argument("--epochs",       type=int,   default=200)
-    parser.add_argument("--batch_size",   type=int,   default=16,
-                        help="Batch size PER GPU")
-    parser.add_argument("--lr",           type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)   # BUG FIX: 0.1 → 1e-4 (terlalu agresif)
-    parser.add_argument("--num_workers",  type=int,   default=4)
-    parser.add_argument("--checkpoint",   type=str,   default="./checkpoints")
-    parser.add_argument("--resume",       type=str,   default=None)
-    parser.add_argument("--lambda_1",     type=float, default=1.0)
-    parser.add_argument("--lambda_2",     type=float, default=0.5)
-    parser.add_argument("--lambda_3",     type=float, default=0.3)
-    parser.add_argument("--lambda_4",     type=float, default=0.3, help="Weight for score supervision loss")
-    parser.add_argument("--alpha",        type=float, default=0.7, help="Contour fraction in selector")
-    parser.add_argument("--threshold",    type=float, default=0.5, help="NC threshold contour vs flat")
-    parser.add_argument("--num_class",     type=int,   default=10,  help="Number of classes")
-    parser.add_argument("--lambda_cls",    type=float, default=0.5, help="Weight for classification loss")
-    return parser.parse_args()
+
+    # ── Dataset ───────────────────────────────────────────────────────
+    dataset_grp = parser.add_argument_group("Dataset")
+    dataset_grp.add_argument(
+        "--dataset", type=str, default="modelnet40",
+        choices=SUPPORTED_DATASETS,
+        help=(
+            "Dataset yang digunakan. "
+            "'modelnet10' = 10 kelas, 'modelnet40' = 40 kelas. "
+            "num_class di-set otomatis kecuali --num_class di-override."
+        ),
+    )
+    dataset_grp.add_argument(
+        "--data_root", type=str, default="./data",
+        help="Root folder data. Harus berisi sub-folder sesuai --dataset.",
+    )
+
+    # ── Model ─────────────────────────────────────────────────────────
+    model_grp = parser.add_argument_group("Model")
+    model_grp.add_argument("--n_points",  type=int,   default=1024)
+    model_grp.add_argument("--M",         type=int,   default=512,
+                           help="Jumlah simplified output points")
+    model_grp.add_argument(
+        "--num_class", type=int, default=None,
+        help=(
+            "Override jumlah kelas. Jika tidak di-set, otomatis mengikuti --dataset "
+            "(modelnet10→10, modelnet40→40)."
+        ),
+    )
+    model_grp.add_argument("--k",         type=int,   default=20)
+    model_grp.add_argument("--alpha",     type=float, default=0.7,
+                           help="Contour fraction in selector")
+    model_grp.add_argument("--threshold", type=float, default=0.5,
+                           help="NC threshold contour vs flat")
+
+    # ── Training ──────────────────────────────────────────────────────
+    train_grp = parser.add_argument_group("Training")
+    train_grp.add_argument("--epochs",       type=int,   default=200)
+    train_grp.add_argument("--batch_size",   type=int,   default=16,
+                           help="Batch size PER GPU")
+    train_grp.add_argument("--lr",           type=float, default=1e-4)
+    train_grp.add_argument("--weight_decay", type=float, default=1e-4)
+    train_grp.add_argument("--num_workers",  type=int,   default=4)
+    train_grp.add_argument("--checkpoint",   type=str,   default="./checkpoints")
+    train_grp.add_argument("--resume",       type=str,   default=None)
+
+    # ── Loss weights ──────────────────────────────────────────────────
+    loss_grp = parser.add_argument_group("Loss weights")
+    loss_grp.add_argument("--lambda_1",   type=float, default=1.0)
+    loss_grp.add_argument("--lambda_2",   type=float, default=0.5)
+    loss_grp.add_argument("--lambda_3",   type=float, default=0.3)
+    loss_grp.add_argument("--lambda_4",   type=float, default=0.3,
+                          help="Weight for score supervision loss")
+    loss_grp.add_argument("--lambda_cls", type=float, default=0.5,
+                          help="Weight for classification loss")
+
+    return _resolve_num_class(parser.parse_args())
 
 
 # ---------------------------------------------------------------------------

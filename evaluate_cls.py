@@ -22,7 +22,7 @@ import torch
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from proposed_method.train import PointCloudDataset
+from proposed_method.train import PointCloudDataset, DATASET_CONFIG, SUPPORTED_DATASETS
 from proposed_method.model import PointCloudSimplifier
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -82,18 +82,61 @@ def evaluate(model, loader, device, num_class, tta=False, tta_runs=10):
 
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--checkpoint", default="./checkpoints/best.pth")
-    p.add_argument("--data_root",  default="./data")
-    p.add_argument("--M",          type=int, default=512)
-    p.add_argument("--num_class",  type=int, default=10)
-    p.add_argument("--n_points",   type=int, default=1024)
-    p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--num_workers",type=int, default=4)
-    p.add_argument("--runs",       type=int, default=5,
-                   help="Jumlah run untuk averaging (atasi non-determinism)")
-    p.add_argument("--seed",       type=int, default=42)
+    p = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # ── Dataset ───────────────────────────────────────────────────────
+    dataset_grp = p.add_argument_group("Dataset")
+    dataset_grp.add_argument(
+        "--dataset", type=str, default="modelnet40",
+        choices=SUPPORTED_DATASETS,
+        help=(
+            "Dataset yang dievaluasi. "
+            "'modelnet10' = 10 kelas, 'modelnet40' = 40 kelas. "
+            "num_class di-set otomatis kecuali --num_class di-override."
+        ),
+    )
+    dataset_grp.add_argument("--data_root",  default="./data",
+                             help="Root folder data.")
+
+    # ── Model ─────────────────────────────────────────────────────────
+    model_grp = p.add_argument_group("Model")
+    model_grp.add_argument("--checkpoint", default="./checkpoints/best.pth")
+    model_grp.add_argument("--M",          type=int, default=512)
+    model_grp.add_argument(
+        "--num_class", type=int, default=None,
+        help=(
+            "Override jumlah kelas. Jika tidak di-set, otomatis mengikuti --dataset "
+            "(modelnet10→10, modelnet40→40)."
+        ),
+    )
+    model_grp.add_argument("--n_points",   type=int, default=1024)
+
+    # ── Evaluation ────────────────────────────────────────────────────
+    eval_grp = p.add_argument_group("Evaluation")
+    eval_grp.add_argument("--batch_size",  type=int, default=32)
+    eval_grp.add_argument("--num_workers", type=int, default=4)
+    eval_grp.add_argument("--runs",        type=int, default=5,
+                          help="Jumlah run untuk averaging (atasi non-determinism)")
+    eval_grp.add_argument("--seed",        type=int, default=42)
+
     args = p.parse_args()
+
+    # Auto-resolve num_class dari dataset config
+    cfg = DATASET_CONFIG[args.dataset]
+    if args.num_class is None:
+        args.num_class = cfg["num_class"]
+        logger.info(
+            f"num_class di-set otomatis ke {args.num_class} "
+            f"sesuai dataset '{args.dataset}'"
+        )
+    elif args.num_class != cfg["num_class"]:
+        logger.warning(
+            f"num_class={args.num_class} berbeda dari default dataset "
+            f"'{args.dataset}' ({cfg['num_class']}). "
+            "Pastikan ini disengaja."
+        )
 
     # ── Determinism ────────────────────────────────────────────────────────
     torch.manual_seed(args.seed)
@@ -103,10 +146,14 @@ def main():
     np.random.seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Device: {device}  seed={args.seed}  runs={args.runs}")
+    logger.info(
+        f"Device: {device}  seed={args.seed}  runs={args.runs}  "
+        f"dataset={args.dataset} ({args.num_class} kelas)"
+    )
 
     # Dataset
-    test_ds = PointCloudDataset(args.data_root, "test", args.n_points, augment=False)
+    test_ds = PointCloudDataset(args.data_root, "test", args.n_points,
+                                augment=False, dataset=args.dataset)
     loader  = DataLoader(test_ds, args.batch_size, shuffle=False,
                          num_workers=args.num_workers, pin_memory=True)
     logger.info(f"Test samples: {len(test_ds)}")
@@ -132,6 +179,7 @@ def main():
     macc_mean = round(np.mean(macc_list), 2)
 
     print(f"\n{'='*45}")
+    print(f"  Dataset          : {args.dataset.upper()} ({args.num_class} kelas)")
     print(f"  Runs             : {args.runs}")
     print(f"  Overall Accuracy : {oa_mean:.2f}% ± {oa_std:.2f}%")
     print(f"  Mean Class Acc   : {macc_mean:.2f}%")

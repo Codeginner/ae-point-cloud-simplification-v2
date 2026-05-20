@@ -42,7 +42,8 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from proposed_method.model import PointCloudSimplifier
-from proposed_method.train import PointCloudDataset, DATASET_CONFIG, SUPPORTED_DATASETS
+from proposed_method.train import (PointCloudDataset, ModelNet40H5, build_dataset,
+                                   DATASET_CONFIG, SUPPORTED_DATASETS)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -185,7 +186,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pointnet_ckpt", required=True,
                    help="Path ke pretrained PointNet checkpoint (.pth)")
     p.add_argument("--data_root",     default="./data",
-                   help="Root folder data (berisi sub-folder modelnet40/ atau modelnet10/)")
+                   help="Root folder data. Untuk --data_format hdf5, arahkan ke "
+                        "modelnet40_ply_hdf5_2048/. Untuk npy, ke root data/.")
+    p.add_argument("--data_format",   default="npy", choices=["npy", "hdf5"],
+                   help="'hdf5' = format official APES (modelnet40_ply_hdf5_2048), "
+                        "'npy' = format repo ini.")
     p.add_argument("--dataset",       default="modelnet40", choices=SUPPORTED_DATASETS,
                    help="Dataset yang dipakai")
 
@@ -234,15 +239,14 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}  |  TTA: {args.tta}  |  dataset: {args.dataset}")
 
-    # ── Dataset — pakai PointCloudDataset (format .npy) ──────────────
+    # ── Dataset ───────────────────────────────────────────────────────
     cfg = DATASET_CONFIG[args.dataset]
     if args.num_class == 40 and cfg["num_class"] != 40:
-        # auto-correct kalau user lupa ganti --num_class
         args.num_class = cfg["num_class"]
-    test_ds = PointCloudDataset(
+    test_ds = build_dataset(
         data_root=args.data_root, mode="test",
-        n_points=args.n_points, augment=False,
-        dataset=args.dataset,
+        n_points=args.n_points,   augment=False,
+        dataset=args.dataset,     data_format=args.data_format,
     )
     loader = DataLoader(
         test_ds, batch_size=args.batch_size,

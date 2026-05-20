@@ -52,36 +52,61 @@ logger = logging.getLogger(__name__)
 # PointNet — task network (frozen), arsitektur standar yang dipakai APES
 # ---------------------------------------------------------------------------
 
-class PointNetCls(nn.Module):
-    """PointNet classifier standar untuk ModelNet40.
+class TNet(nn.Module):
+    def __init__(self, k=3):
+        super().__init__()
+        self.k    = k
+        self.conv = nn.Sequential(
+            nn.Conv1d(k,   64,   1), nn.BatchNorm1d(64),   nn.ReLU(),
+            nn.Conv1d(64,  128,  1), nn.BatchNorm1d(128),  nn.ReLU(),
+            nn.Conv1d(128, 1024, 1), nn.BatchNorm1d(1024), nn.ReLU(),
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(1024, 512), nn.BatchNorm1d(512), nn.ReLU(),
+            nn.Linear(512,  256), nn.BatchNorm1d(256), nn.ReLU(),
+            nn.Linear(256,  k * k),
+        )
+    def forward(self, x):
+        B = x.size(0)
+        x = self.conv(x).max(dim=-1).values
+        x = self.fc(x).view(B, self.k, self.k)
+        x += torch.eye(self.k, device=x.device).unsqueeze(0)
+        return x
 
-    Arsitektur ini identik dengan yang dipakai APES, SampleNet, S-NET, LighTN
-    sebagai task network — sehingga angka OA bisa dibandingkan langsung.
+
+class PointNetCls(nn.Module):
+    """PointNet + T-Net — arsitektur identik dengan train_pointnet.py.
+
+    Harus sama persis dengan yang ditraining, supaya checkpoint bisa di-load.
     """
 
     def __init__(self, num_class: int = 40) -> None:
         super().__init__()
-        self.conv1 = nn.Sequential(
-            nn.Conv1d(3, 64, 1), nn.BatchNorm1d(64), nn.ReLU()
-        )
-        self.conv2 = nn.Sequential(
-            nn.Conv1d(64, 128, 1), nn.BatchNorm1d(128), nn.ReLU()
-        )
-        self.conv3 = nn.Sequential(
-            nn.Conv1d(128, 1024, 1), nn.BatchNorm1d(1024), nn.ReLU()
-        )
+        self.tnet3  = TNet(k=3)
+        self.tnet64 = TNet(k=64)
+        self.conv1 = nn.Sequential(nn.Conv1d(3,   64,   1), nn.BatchNorm1d(64),   nn.ReLU())
+        self.conv2 = nn.Sequential(nn.Conv1d(64,  64,   1), nn.BatchNorm1d(64),   nn.ReLU())
+        self.conv3 = nn.Sequential(nn.Conv1d(64,  128,  1), nn.BatchNorm1d(128),  nn.ReLU())
+        self.conv4 = nn.Sequential(nn.Conv1d(128, 1024, 1), nn.BatchNorm1d(1024), nn.ReLU())
         self.fc = nn.Sequential(
             nn.Linear(1024, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(0.3),
-            nn.Linear(512, 256),  nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(512,  256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.3),
             nn.Linear(256, num_class),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, N, 3) → logits: (B, num_class)"""
-        x = x.permute(0, 2, 1)                    # (B, 3, N)
-        x = self.conv3(self.conv2(self.conv1(x)))  # (B, 1024, N)
-        x = x.max(dim=-1).values                   # (B, 1024) global max-pool
-        return self.fc(x)                          # (B, num_class)
+        x = x.permute(0, 2, 1)
+        t3 = self.tnet3(x)
+        x  = torch.bmm(t3, x)
+        x  = self.conv1(x)
+        x  = self.conv2(x)
+        t64 = self.tnet64(x)
+        x   = torch.bmm(t64, x)
+        x = self.conv3(x)
+        x = self.conv4(x)
+        x = x.max(dim=-1).values
+        return self.fc(x)
 
 
 # ---------------------------------------------------------------------------

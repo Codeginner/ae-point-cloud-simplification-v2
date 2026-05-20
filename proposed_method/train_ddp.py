@@ -51,23 +51,59 @@ else:
 # PointNet frozen — task network untuk task-aware training
 # ---------------------------------------------------------------------------
 
+class STN(nn.Module):
+    """Spatial Transformer Network — T-Net dari PointNet original."""
+    def __init__(self, k: int = 3) -> None:
+        super().__init__()
+        self.k = k
+        self.conv = nn.Sequential(
+            nn.Conv1d(k, 64, 1), nn.BatchNorm1d(64), nn.ReLU(),
+            nn.Conv1d(64, 128, 1), nn.BatchNorm1d(128), nn.ReLU(),
+            nn.Conv1d(128, 1024, 1), nn.BatchNorm1d(1024), nn.ReLU(),
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(1024, 512), nn.BatchNorm1d(512), nn.ReLU(),
+            nn.Linear(512, 256), nn.BatchNorm1d(256), nn.ReLU(),
+            nn.Linear(256, k * k),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B = x.size(0)
+        x = self.conv(x).max(dim=-1).values
+        x = self.fc(x).view(B, self.k, self.k)
+        x += torch.eye(self.k, device=x.device).unsqueeze(0)
+        return x
+
+
 class PointNetCls(nn.Module):
-    """PointNet standar (identik dengan evaluate_apes_protocol.py)."""
+    """Full PointNet classifier dengan T-Net (STN) — identik dengan checkpoint."""
     def __init__(self, num_class: int = 40) -> None:
         super().__init__()
-        self.conv1 = nn.Sequential(nn.Conv1d(3,64,1),    nn.BatchNorm1d(64),   nn.ReLU())
-        self.conv2 = nn.Sequential(nn.Conv1d(64,128,1),  nn.BatchNorm1d(128),  nn.ReLU())
-        self.conv3 = nn.Sequential(nn.Conv1d(128,1024,1), nn.BatchNorm1d(1024), nn.ReLU())
+        self.tnet3  = STN(k=3)
+        self.tnet64 = STN(k=64)
+        self.conv1 = nn.Sequential(nn.Conv1d(3, 64, 1),   nn.BatchNorm1d(64),   nn.ReLU())
+        self.conv2 = nn.Sequential(nn.Conv1d(64, 64, 1),  nn.BatchNorm1d(64),   nn.ReLU())
+        self.conv3 = nn.Sequential(nn.Conv1d(64, 128, 1), nn.BatchNorm1d(128),  nn.ReLU())
+        self.conv4 = nn.Sequential(nn.Conv1d(128, 1024, 1), nn.BatchNorm1d(1024), nn.ReLU())
         self.fc = nn.Sequential(
-            nn.Linear(1024,512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(0.3),
-            nn.Linear(512,256),  nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(1024, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(512, 256),  nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.3),
             nn.Linear(256, num_class),
         )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.permute(0,2,1)
-        x = self.conv3(self.conv2(self.conv1(x)))
-        x = x.max(dim=-1).values
-        return self.fc(x)
+        """x: (B, N, 3) → logits: (B, num_class)"""
+        x = x.permute(0, 2, 1)              # (B, 3, N)
+        # Input transform
+        t3 = self.tnet3(x)                  # (B, 3, 3)
+        x  = torch.bmm(t3, x)              # (B, 3, N)
+        x  = self.conv2(self.conv1(x))      # (B, 64, N)
+        # Feature transform
+        t64 = self.tnet64(x)               # (B, 64, 64)
+        x   = torch.bmm(t64, x)            # (B, 64, N)
+        x   = self.conv4(self.conv3(x))    # (B, 1024, N)
+        x   = x.max(dim=-1).values         # (B, 1024)
+        return self.fc(x)                  # (B, num_class)
 
 
 def load_pointnet_frozen(ckpt_path: str, num_class: int, device: torch.device) -> PointNetCls:

@@ -1,19 +1,17 @@
 """
 model.py — PointCloudSimplifier: main orchestrator.
 
-Full forward pipeline:
-
-    P (B,N,3)
-    ├── DGCNNEncoder          → f_i   (B, N, 448)
-    ├── NCScoreModule         → s_i   (B, N)
-    ├── ImportanceScoringMLP  → score (B, N)
-    ├── AdaptiveSelector      → idx   (B, M)
-    │    └── gather P, f_i → P_s (B,M,3), f_s (B,M,448)
-    ├── FoldingNetDecoder     → P_recon (B, M, 3)
-    └── GeometryAwareLoss     → loss_dict
-
-Class:
-    PointCloudSimplifier
+CHANGES vs original:
+    • Encoder output dim: 1024 (restored full DGCNN)
+    • Scorer input: 1024+1 = 1025
+    • Decoder in_dim: 1024
+    • ClsHead in_dim: 1024
+    • lambda_cls default: 1.0 (naik dari 0.5)
+    • lambda_4 default: 0.1 (turun — score supervision terlalu dominan)
+    • ClsHead: hapus self-attention (mahal + overfitting pada simplified features)
+      ganti ke DGCNN-style EdgeConv head yang lebih cocok untuk point sets
+    • alpha selector: 0.6 (turun dari 0.7) — beri lebih banyak flat points
+      karena untuk klasifikasi global shape, flat regions juga penting
 """
 
 import torch
@@ -31,114 +29,116 @@ from .utils import index_points
 
 
 # ===========================================================================
-# Lightweight Classification Head
-# Takes simplified point features f_s (B, M, 448) → class logits (B, C)
-# Trained jointly with reconstruction — gradient flows through STE to selector
+# Classification Head — DGCNN-style, no self-attention
+# Lebih cocok untuk per-point features dari simplified cloud
 # ===========================================================================
+
+def knn_head(x: Tensor, k: int) -> Tensor:
+    inner = -2 * torch.matmul(x.transpose(2, 1), x)
+    xx    = (x ** 2).sum(dim=1, keepdim=True)
+    dist  = -xx - inner - xx.transpose(2, 1)
+    return dist.topk(k, dim=-1)[1]
+
+
+def get_edge_feat(x: Tensor, k: int) -> Tensor:
+    B, C, N = x.shape
+    idx     = knn_head(x, k)
+    device  = x.device
+    base    = torch.arange(B, device=device).view(-1, 1, 1) * N
+    flat    = (idx + base).view(-1)
+    x_t     = x.transpose(2, 1).contiguous().view(B * N, C)
+    neigh   = x_t[flat].view(B, N, k, C).permute(0, 3, 1, 2)
+    xi      = x.unsqueeze(-1).expand_as(neigh)
+    return torch.cat([xi, neigh - xi], dim=1)   # (B, 2C, N, k)
+
 
 class ClsHead(nn.Module):
     """
-    Classification head over simplified point features.
+    DGCNN-style classification head.
 
-    Upgrade dari versi sebelumnya (global max+mean pool -> MLP):
-    Sekarang pakai:
-      1. Self-attention layer untuk capture inter-point context
-      2. Multi-scale pooling: max + mean + std  (3x richer descriptor)
-      3. 3-layer MLP dengan BN + dropout
+    Input : f_s (B, M, in_dim)  — simplified point features
+    Output: logits (B, num_class)
 
-    Args:
-        in_dim    : feature dimension dari encoder (448)
-        num_class : jumlah kelas output
-        dropout   : dropout rate
+    Architecture:
+        EdgeConv(in_dim → 256) + max-pool
+        EdgeConv(256 → 256) + max-pool
+        concat max+mean global → 512
+        Linear(512 → 256 → num_class)
+
+    Kenapa bukan self-attention:
+        Self-attention bagus untuk long-range context, tapi untuk M=512
+        points yang sudah di-simplify, EdgeConv yang pakai local geometry
+        lebih robust — terutama karena simplified cloud bisa punya distribusi
+        yang irregular (clustered di contours).
     """
-    def __init__(self, in_dim: int = 448, num_class: int = 10, dropout: float = 0.5): #nyoba dropout 0.2 instead of 0.5
+
+    def __init__(self, in_dim: int = 1024, num_class: int = 10,
+                 k: int = 20, dropout: float = 0.5):
         super().__init__()
+        self.k = k
 
-        # 1. Self-attention untuk inter-point context
-        self.attn = nn.MultiheadAttention(
-            embed_dim=in_dim,
-            num_heads=8, # coba 4 instead of 8
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.attn_norm = nn.LayerNorm(in_dim)
-
-        # 2. Project setelah attention
+        # Project dulu ke 256 supaya EdgeConv tidak terlalu mahal
         self.proj = nn.Sequential(
-            nn.Linear(in_dim, in_dim, bias=False),
-            nn.LayerNorm(in_dim),
-            nn.GELU(),
+            nn.Conv1d(in_dim, 256, 1, bias=False),
+            nn.BatchNorm1d(256),
+            nn.LeakyReLU(0.2),
         )
 
-        # 3. MLP: input = max+mean+std pooling = in_dim * 3
-        pool_dim = in_dim * 3
+        self.ec1 = nn.Sequential(
+            nn.Conv2d(512, 256, 1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2),
+        )
+        self.ec2 = nn.Sequential(
+            nn.Conv2d(512, 256, 1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2),
+        )
+
         self.mlp = nn.Sequential(
-            nn.Linear(pool_dim, 512, bias=False),
+            nn.Linear(512, 512, bias=False),
             nn.BatchNorm1d(512),
-            nn.GELU(),
+            nn.LeakyReLU(0.2),
             nn.Dropout(dropout),
             nn.Linear(512, 256, bias=False),
             nn.BatchNorm1d(256),
-            nn.GELU(),
+            nn.LeakyReLU(0.2),
             nn.Dropout(dropout * 0.5),
             nn.Linear(256, num_class),
         )
 
     def forward(self, f_s: Tensor) -> Tensor:
-        """
-        Args:
-            f_s : simplified point features (B, M, 448)
-        Returns:
-            logits : (B, num_class)
-        """
-        # 1. Self-attention: setiap point attend ke semua simplified points
-        attn_out, _ = self.attn(f_s, f_s, f_s)        # (B, M, 448)
-        f_s = self.attn_norm(f_s + attn_out)           # residual + norm
+        """f_s: (B, M, in_dim) → logits: (B, num_class)"""
+        x = f_s.permute(0, 2, 1)           # (B, in_dim, M)
+        x = self.proj(x)                    # (B, 256, M)
 
-        # 2. Project
-        f_s = self.proj(f_s)                           # (B, M, 448)
+        k = min(self.k, x.shape[-1] - 1)
 
-        # 3. Multi-scale pooling: max + mean + std
-        f_max  = f_s.max(dim=1).values                 # (B, 448)
-        f_mean = f_s.mean(dim=1)                       # (B, 448)
-        f_std  = f_s.std(dim=1)                        # (B, 448)
-        g = torch.cat([f_max, f_mean, f_std], dim=-1)  # (B, 1344)
+        e1 = self.ec1(get_edge_feat(x, k)).max(dim=-1)[0]   # (B, 256, M)
+        e2 = self.ec2(get_edge_feat(e1, k)).max(dim=-1)[0]  # (B, 256, M)
 
-        return self.mlp(g)                             # (B, num_class)
+        g = torch.cat([e1.max(-1)[0], e2.max(-1)[0]], dim=1)  # (B, 512)
+        return self.mlp(g)
 
 
 class PointCloudSimplifier(nn.Module):
     """
     End-to-end point cloud simplification framework.
-
-    Proposed-method pipeline:
-
-        Point Cloud
-            ↓
-        DGCNN Encoder
-            ↓
-        NC Score
-            ↓
-        Importance Scoring
-            ↓
-        Geometry-Balanced Selection
-            ↓
-        FoldingNet Reconstruction
     """
 
     def __init__(
         self,
-        M: int = 1024,
+        M: int = 512,
         k: int = 20,
-        alpha: float = 0.7,
+        alpha: float = 0.6,          # CHANGED: 0.7→0.6
         threshold: float = 0.5,
         latent_dim: int = 1024,
         lambda_1: float = 1.0,
         lambda_2: float = 0.5,
         lambda_3: float = 0.3,
-        lambda_4: float = 0.5,
+        lambda_4: float = 0.1,       # CHANGED: 0.3→0.1 (score supervision less dominant)
         num_class: int = 10,
-        lambda_cls: float = 0.5,
+        lambda_cls: float = 1.0,     # CHANGED: 0.5→1.0
     ) -> None:
 
         super().__init__()
@@ -146,62 +146,25 @@ class PointCloudSimplifier(nn.Module):
         self.M = M
         self.lambda_cls = lambda_cls
 
-        # --------------------------------------------------------------
-        # Encoder
-        # Output:
-        # f_i shape = (B,N,448)
-        # --------------------------------------------------------------
-
+        # Encoder — full 4-layer DGCNN, output dim = 1024
         self.encoder = DGCNNEncoder(k=k)
+        enc_dim = self.encoder.out_dim   # 1024
 
-        # --------------------------------------------------------------
-        # NC Score Module
-        # No learnable parameters
-        # --------------------------------------------------------------
-
+        # NC Score — no learnable params
         self.nc_module = NCScoreModule(k=k)
-
         for p in self.nc_module.parameters():
             p.requires_grad_(False)
 
-        # --------------------------------------------------------------
-        # Importance Scoring MLP
-        # Input:
-        # 448 + 1 = 449
-        # --------------------------------------------------------------
+        # Scorer: enc_dim + 1 (nc score)
+        self.scorer = ImportanceScoringMLP(in_dim=enc_dim + 1)
 
-        # ini bagian yang diubah
-        self.scorer = ImportanceScoringMLP(
-            in_dim=449,
-        )
+        # Selector
+        self.selector = AdaptiveSelector(M=M, alpha=alpha, threshold=threshold)
 
-        # --------------------------------------------------------------
-        # Adaptive Geometry-Balanced Selector
-        # --------------------------------------------------------------
+        # Decoder: in_dim = enc_dim
+        self.decoder = FoldingNetDecoder(M=M, in_dim=enc_dim, latent_dim=latent_dim)
 
-        self.selector = AdaptiveSelector(
-            M=M,
-            alpha=alpha,
-            threshold=threshold,
-        )
-
-        # --------------------------------------------------------------
-        # FoldingNet Decoder
-        # Input feature:
-        # 448 dim
-        # --------------------------------------------------------------
-
-        # ini bagian yang diubah
-        self.decoder = FoldingNetDecoder(
-            M=M,
-            in_dim=448,
-            latent_dim=latent_dim,
-        )
-
-        # --------------------------------------------------------------
-        # Geometry-aware loss
-        # --------------------------------------------------------------
-
+        # Loss
         self.loss_fn = GeometryAwareLoss(
             lambda_1=lambda_1,
             lambda_2=lambda_2,
@@ -209,107 +172,36 @@ class PointCloudSimplifier(nn.Module):
             lambda_4=lambda_4,
         )
 
-        # --------------------------------------------------------------
-        # Classification Head (joint training)
-        # Input: f_s (B, M, 448) → logits (B, num_class)
-        # --------------------------------------------------------------
-
-        self.cls_head = ClsHead(
-            in_dim=448,
-            num_class=num_class,
-        )
-
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
+        # Cls Head: in_dim = enc_dim
+        self.cls_head = ClsHead(in_dim=enc_dim, num_class=num_class, k=min(k, M - 1))
 
     def forward(
         self,
         P: Tensor,
         labels: Tensor = None,
         compute_loss: bool = True,
-    ) -> dict[str, Tensor]:
-        """
-        Args:
-            P:
-                Input point cloud
-                shape = (B,N,3)
+    ) -> dict:
 
-            compute_loss:
-                Whether to compute geometry-aware loss.
-
-        Returns:
-            Dictionary containing:
-                • simplified point cloud
-                • reconstructed point cloud
-                • importance scores
-                • selected indices
-                • optional loss dictionary
-        """
-
-        # --------------------------------------------------------------
-        # 1. DGCNN Encoder
-        # f_i shape = (B,N,448)
-        # --------------------------------------------------------------
-
+        # 1. Encoder → (B, N, 1024)
         f_i = self.encoder(P)
 
-        # --------------------------------------------------------------
-        # 2. NC Score
-        # s_i shape = (B,N)
-        # --------------------------------------------------------------
-
+        # 2. NC Score → (B, N)
         with torch.no_grad():
-
             s_i = self.nc_module(P)
 
-        # --------------------------------------------------------------
-        # 3. Importance Scoring
-        # score shape = (B,N)
-        # --------------------------------------------------------------
+        # 3. Importance Scoring → (B, N)
+        score = self.scorer(f_i, s_i)
 
-        score = self.scorer(
-            f_i,
-            s_i
-        )
-
-        # --------------------------------------------------------------
-        # 4. Adaptive Geometry-Balanced Selection
-        # idx shape = (B,M)
-        # --------------------------------------------------------------
-
-        # --------------------------------------------------------------
-        # 4. Adaptive Geometry-Balanced Selection  (vectorised + STE)
-        #    Returns idx  (B, M)   — integer indices for feature gather
-        #            P_s  (B, M, 3) — differentiable via STE
-        # --------------------------------------------------------------
-
+        # 4. Adaptive Selection → idx (B,M), P_s (B,M,3)
         idx, P_s = self.selector(P, score, s_i)
 
-        # --------------------------------------------------------------
-        # 5. Gather simplified features
-        # --------------------------------------------------------------
+        # 5. Gather simplified features → (B, M, 1024)
+        f_s = index_points(f_i, idx)
 
-        f_s = index_points(f_i, idx)            # (B, M, 448)
+        # 6. Decode → (B, M, 3)
+        P_recon = self.decoder(P_s, f_s)
 
-        # --------------------------------------------------------------
-        # 6. FoldingNet Reconstruction
-        # --------------------------------------------------------------
-
-        P_recon = self.decoder(
-            P_s,
-            f_s
-        )                                           # (B,M,3)
-
-        # --------------------------------------------------------------
-        # Output dictionary
-        # --------------------------------------------------------------
-
-        # --------------------------------------------------------------
-        # 7. Classification Head
-        # logits shape = (B, num_class)
-        # --------------------------------------------------------------
-
+        # 7. Classification → (B, num_class)
         logits = self.cls_head(f_s)
 
         out = {
@@ -320,20 +212,9 @@ class PointCloudSimplifier(nn.Module):
             "logits":       logits,
         }
 
-        # --------------------------------------------------------------
-        # 8. Joint loss: geometry + classification
-        # --------------------------------------------------------------
-
         if compute_loss:
+            loss_dict = self.loss_fn(P_recon, P, P_s, score)
 
-            loss_dict = self.loss_fn(
-                P_recon,
-                P,
-                P_s,
-                score,
-            )
-
-            # Classification loss (only when labels provided)
             if labels is not None:
                 L_cls = F.cross_entropy(logits, labels)
                 loss_dict["cls"]   = L_cls

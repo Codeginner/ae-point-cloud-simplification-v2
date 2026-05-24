@@ -130,7 +130,7 @@ def evaluate(args):
         'Random Sampling': lambda pc, M: random_sampling(pc, M),
         'FPS':             lambda pc, M: fps(pc, M),
         # 'APES':          lambda pc, M: apes(pc, M),   # refer to paper
-        'Proposed':        lambda pc, M: proposed(pc, M),
+        'Proposed':        lambda pc, M: proposed(pc, M=M, labels=None, compute_loss=False)['P_simplified'],
     }
 
     results = {}   # results[method][M] = {'oa': float, 'cd': float, 'time_ms': float}

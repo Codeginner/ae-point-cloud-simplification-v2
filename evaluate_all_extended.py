@@ -41,10 +41,13 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 # ── adjust these imports to match your project layout ──────────────────────────
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "script"))
+
 from proposed_method.model import ProposedSimplifier          # your model
 from proposed_method.dataset import ModelNet40Dataset         # your dataloader
-from baselines.apes import APESSampler                        # APES wrapper
-import pointnet_cls as PointNetCls                            # pretrained PointNet
+# from baselines.apes import APESSampler                      # APES skipped — refer to paper
+from script.train_pointnet import PointNetCls                 # pretrained PointNet
 # ───────────────────────────────────────────────────────────────────────────────
 
 
@@ -116,15 +119,15 @@ def evaluate(args):
     pointnet.load_state_dict(torch.load(args.pointnet_ckpt, map_location=device))
     pointnet.eval()
 
-    apes = APESSampler().to(device)
-    apes.eval()
+    # APES skipped — results taken from paper
+    # apes = APESSampler().to(device)
 
     # ── methods to evaluate ───────────────────────────────────────────────────
     #    Each entry: (display_name, callable(pc, M) → simplified_pc)
     methods = {
         'Random Sampling': lambda pc, M: random_sampling(pc, M),
         'FPS':             lambda pc, M: fps(pc, M),
-        'APES':            lambda pc, M: apes(pc, M),
+        # 'APES':          lambda pc, M: apes(pc, M),   # refer to paper
         'Proposed':        lambda pc, M: proposed(pc, M),
     }
 

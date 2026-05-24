@@ -226,4 +226,5 @@ class PointCloudSimplifier(nn.Module):
 
         return out
 
+# Alias for backwards-compatible imports
 ProposedSimplifier = PointCloudSimplifier

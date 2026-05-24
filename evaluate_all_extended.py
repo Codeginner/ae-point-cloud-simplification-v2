@@ -111,10 +111,20 @@ def evaluate(args):
 
     # ── load models ───────────────────────────────────────────────────────────
     # FIXED
+    '''
     proposed = ProposedSimplifier(num_class=40).to(device)
     ckpt_proposed = torch.load(args.checkpoint, map_location=device)
     proposed.load_state_dict(ckpt_proposed['model_state_dict'] if 'model_state_dict' in ckpt_proposed else ckpt_proposed)
     proposed.eval()
+    '''
+    ckpt_proposed = torch.load(args.checkpoint, map_location=device)
+    ckpt_sd = ckpt_proposed['model_state_dict'] if 'model_state_dict' in ckpt_proposed else ckpt_proposed
+
+    def load_proposed(M):
+        m = ProposedSimplifier(num_class=40, M=M).to(device)
+        m.load_state_dict(ckpt_sd)
+        m.eval()
+        return m
     
     pointnet = PointNetCls().to(device)
     ckpt_pn = torch.load(args.pointnet_ckpt, map_location=device)
@@ -130,7 +140,7 @@ def evaluate(args):
         'Random Sampling': lambda pc, M: random_sampling(pc, M),
         'FPS':             lambda pc, M: fps(pc, M),
         # 'APES':          lambda pc, M: apes(pc, M),   # refer to paper
-        'Proposed':        lambda pc, M: proposed(pc, M=M, labels=None, compute_loss=False)['P_simplified'],
+        'Proposed':        lambda pc, M: load_proposed(M)(pc, labels=None, compute_loss=False)['P_simplified'],
     }
 
     results = {}   # results[method][M] = {'oa': float, 'cd': float, 'time_ms': float}

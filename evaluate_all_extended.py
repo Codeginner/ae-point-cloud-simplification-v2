@@ -111,8 +111,9 @@ def evaluate(args):
 
     # ── load models ───────────────────────────────────────────────────────────
     proposed = ProposedSimplifier(num_class=40).to(device)
-    ckpt = torch.load(args.checkpoint, map_location=device)
-    proposed.load_state_dict(ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt)
+    # FIXED
+    ckpt = torch.load(args.pointnet_ckpt, map_location=device)
+    pointnet.load_state_dict(ckpt['model'] if 'model' in ckpt else ckpt)
     proposed.eval()
 
     pointnet = PointNetCls().to(device)

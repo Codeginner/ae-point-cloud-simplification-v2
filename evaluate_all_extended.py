@@ -110,14 +110,15 @@ def evaluate(args):
                          num_workers=4, pin_memory=True)
 
     # ── load models ───────────────────────────────────────────────────────────
-    proposed = ProposedSimplifier(num_class=40).to(device)
     # FIXED
-    ckpt = torch.load(args.pointnet_ckpt, map_location=device)
-    pointnet.load_state_dict(ckpt['model'] if 'model' in ckpt else ckpt)
+    proposed = ProposedSimplifier(num_class=40).to(device)
+    ckpt_proposed = torch.load(args.checkpoint, map_location=device)
+    proposed.load_state_dict(ckpt_proposed['model_state_dict'] if 'model_state_dict' in ckpt_proposed else ckpt_proposed)
     proposed.eval()
-
+    
     pointnet = PointNetCls().to(device)
-    pointnet.load_state_dict(torch.load(args.pointnet_ckpt, map_location=device))
+    ckpt_pn = torch.load(args.pointnet_ckpt, map_location=device)
+    pointnet.load_state_dict(ckpt_pn['model'] if 'model' in ckpt_pn else ckpt_pn)
     pointnet.eval()
 
     # APES skipped — results taken from paper

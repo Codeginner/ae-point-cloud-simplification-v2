@@ -110,7 +110,7 @@ def evaluate(args):
                          num_workers=4, pin_memory=True)
 
     # ── load models ───────────────────────────────────────────────────────────
-    proposed = ProposedSimplifier().to(device)
+    proposed = ProposedSimplifier(num_class=40).to(device)
     ckpt = torch.load(args.checkpoint, map_location=device)
     proposed.load_state_dict(ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt)
     proposed.eval()

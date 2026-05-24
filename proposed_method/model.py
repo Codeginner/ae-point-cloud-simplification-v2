@@ -225,3 +225,5 @@ class PointCloudSimplifier(nn.Module):
             out["loss"] = loss_dict
 
         return out
+
+ProposedSimplifier = PointCloudSimplifier

@@ -135,9 +135,22 @@ def load_from_hdf5(data_root: str, mode: str, sample_idx: int,
                    n_points: int = 1024, class_name: str = None):
     import glob, h5py
 
-    files = sorted(glob.glob(f"{data_root}/{mode}*.h5"))
+    # Coba berbagai pola nama file yang umum dipakai ModelNet40 HDF5
+    patterns = [
+        f"{data_root}/{mode}*.h5",           # test*.h5
+        f"{data_root}/ply_data_{mode}*.h5",  # ply_data_test*.h5  ← format Kaggle
+        f"{data_root}/*{mode}*.h5",          # *test*.h5 (fallback)
+    ]
+    files = []
+    for pat in patterns:
+        files = sorted(glob.glob(pat))
+        if files:
+            break
     if not files:
-        raise FileNotFoundError(f"Tidak ada file .h5 di {data_root} dengan prefix '{mode}'")
+        raise FileNotFoundError(
+            f"Tidak ada file .h5 di '{data_root}' untuk mode='{mode}'.\n"
+            f"  File yang ada: {sorted(glob.glob(data_root + '/*.h5'))}"
+        )
 
     all_pts, all_labels = [], []
     for f in files:

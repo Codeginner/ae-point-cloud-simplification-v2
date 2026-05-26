@@ -271,6 +271,20 @@ def train_one_epoch(
             L_task = nn.functional.cross_entropy(logits, labels)
             loss["task"]  = L_task
             loss["total"] = loss["total"] + lambda_task * L_task
+
+            # Ranking loss: force scorer to assign higher scores to selected
+            # points vs unselected — direct gradient to scorer, bypasses STE
+            score        = out["score"]                        # (B, N)
+            idx          = out["idx"]                          # (B, M)
+            B_           = score.shape[0]
+            sel_scores   = score.gather(1, idx)                # (B, M)
+            unsel_mask   = torch.ones_like(score, dtype=torch.bool)
+            unsel_mask.scatter_(1, idx, False)
+            unsel_scores = score[unsel_mask].view(B_, -1)      # (B, N-M)
+            L_rank = torch.clamp(
+                unsel_scores.mean(1) - sel_scores.mean(1) + 0.1, min=0
+            ).mean()
+            loss["total"] = loss["total"] + lambda_task * L_rank
         else:
             loss["task"] = torch.tensor(0.0, device=device)
 
